@@ -22,6 +22,7 @@ T_mult: 2
 weight_decay: 0.01  
 model_sharding: true  
 num_shards: 3
+subset_size: 1000
 
 # Mixed Precision and Optimization
 use_mixed_precision: true
