@@ -62,7 +62,7 @@ tokenizer_config_path: './tokenizer_config.json'
 
 # Teacher model configuration
 teacher_model_name: "numina7b"
-teacher_batch_size: 16
+teacher_batch_size: 8
 
 # Evaluation
 eval_interval: 1000
