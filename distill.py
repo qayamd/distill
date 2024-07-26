@@ -618,7 +618,7 @@ def main():
     config.device = device
     if torch.cuda.is_available():
         total_gpu_memory = torch.cuda.get_device_properties(device).total_memory
-        config.max_tokens_per_batch = int(total_gpu_memory * 0.7 // (config.n_positions * 4))
+        config.max_tokens_per_batch = int(total_gpu_memory * 0.4 // (config.n_positions * 4))
     else:
         config.max_tokens_per_batch = 1024  # Default value for CPU
 
