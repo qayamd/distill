@@ -516,15 +516,16 @@ class DistillationTrainer:
             )
             logger.info(f"Increased sequence length to {self.current_seq_length}")
 
+
 def setup_data_and_model(config):
     logger.info("Starting setup_data_and_model")
     start_time = time.time()
 
     tokenizer = load_tokenizer(config)
     
-    if not hasattr(config, 'vocab_size'):
-        config.vocab_size = len(tokenizer)
-        logger.info(f"Setting vocab_size to {config.vocab_size} based on tokenizer")
+    # Set the vocab_size based on the tokenizer
+    config.vocab_size = len(tokenizer)
+    logger.info(f"Setting vocab_size to {config.vocab_size} based on tokenizer")
 
     logger.info("Loading datasets")
     datasets = {
@@ -576,7 +577,7 @@ def setup_data_and_model(config):
             logger.error(f"Error creating data loaders for {name}: {e}")
             continue
 
-    logger.info(f"Initializing model with vocab size: {config.vocab_size}")
+    logger.info(f"Initializing student model with vocab size: {config.vocab_size}")
     model = EnhancedPEERLanguageModel(config, config.n_experts, config.n_heads, config.top_k, config.d_key, share_params=config.share_params)
     
     logger.info("Loading teacher model")
@@ -586,6 +587,10 @@ def setup_data_and_model(config):
         raise ValueError(f"Found {len(safetensor_files)} SafeTensors files. Expected exactly 3.")
     logger.info(f"Found SafeTensors files: {', '.join(safetensor_files)}")
     teacher_model = TeacherModel(safetensor_files)
+
+    # Ensure the teacher model uses the same vocabulary size
+    teacher_model.model.resize_token_embeddings(config.vocab_size)
+    logger.info(f"Adjusted teacher model vocab size to {config.vocab_size}")
 
     logger.info(f"setup_data_and_model completed in {time.time() - start_time:.2f} seconds")
     return model, teacher_model, tokenizer, train_loaders, val_loaders
