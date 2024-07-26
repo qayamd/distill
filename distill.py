@@ -24,6 +24,7 @@ from modifiedadam import Adam_mini
 import torch.nn.utils.prune as prune
 from transformers import PreTrainedTokenizerFast
 from transformers import AutoModelForCausalLM, AutoConfig
+from itertools import islice
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -521,6 +522,10 @@ def setup_data_and_model(config):
 
     tokenizer = load_tokenizer(config)
     
+    if not hasattr(config, 'vocab_size'):
+        config.vocab_size = len(tokenizer)
+        logger.info(f"Setting vocab_size to {config.vocab_size} based on tokenizer")
+
     logger.info("Loading datasets")
     datasets = {
         'numina_cot': load_dataset("AI-MO/NuminaMath-CoT")
@@ -531,7 +536,16 @@ def setup_data_and_model(config):
         logger.info(f"Processing {name} dataset")
         try:
             start_process_time = time.time()
-            processed_datasets[name] = EnhancedMathReasoningDataset(dataset['train'], tokenizer, max_length=config.n_positions)
+            
+            # Use a subset of the data if specified in config
+            if hasattr(config, 'subset_size') and config.subset_size > 0:
+                subset_size = min(config.subset_size, len(dataset['train']))
+                logger.info(f"Using a subset of {subset_size} examples from {name} dataset")
+                subset_data = list(islice(dataset['train'], subset_size))
+                processed_datasets[name] = EnhancedMathReasoningDataset(subset_data, tokenizer, max_length=config.n_positions)
+            else:
+                processed_datasets[name] = EnhancedMathReasoningDataset(dataset['train'], tokenizer, max_length=config.n_positions)
+            
             logger.info(f"{name} dataset processed in {time.time() - start_process_time:.2f} seconds. Size: {len(processed_datasets[name])}")
         except Exception as e:
             logger.error(f"Error processing {name} dataset: {e}")
