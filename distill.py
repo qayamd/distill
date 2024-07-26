@@ -14,12 +14,12 @@ import re
 import yaml
 import json
 import logging
+import time
 from sklearn.metrics import accuracy_score, mean_squared_error
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.tensorboard import SummaryWriter
 from torch.quantization import quantize_dynamic, QuantStub, DeQuantStub
 from safetensors.torch import load_file
-#FIXME: fully test the updated adam optimizer
 from modifiedadam import Adam_mini
 import torch.nn.utils.prune as prune
 from transformers import PreTrainedTokenizerFast
@@ -29,7 +29,13 @@ from transformers import AutoModelForCausalLM, AutoConfig
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Set the cache directory for datasets
+datasets.config.HF_DATASETS_CACHE = "./datasets"
+
 def load_tokenizer(config):
+    logger.info("Starting to load tokenizer")
+    start_time = time.time()
+    
     # Load tokenizer configuration
     try:
         with open(config.tokenizer_config_path, 'r', encoding='utf-8') as f:
@@ -78,23 +84,23 @@ def load_tokenizer(config):
     logger.info(f"BOS token is set: {tokenizer.bos_token is not None}")
     logger.info(f"EOS token is set: {tokenizer.eos_token is not None}")
 
+    logger.info(f"Tokenizer loaded in {time.time() - start_time:.2f} seconds")
     return tokenizer
-
-
-
-# Set the cache directory for datasets
-datasets.config.HF_DATASETS_CACHE = "./datasets"
 
 class EnhancedMathReasoningDataset(Dataset):
     def __init__(self, dataset, tokenizer, max_length):
+        logger.info(f"Initializing EnhancedMathReasoningDataset with {len(dataset)} items")
+        start_time = time.time()
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.max_length = max_length
+        logger.info(f"EnhancedMathReasoningDataset initialized in {time.time() - start_time:.2f} seconds")
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        start_time = time.time()
         item = self.dataset[idx]
         if 'question' in item:  # GSM8K format
             dialog = f"Question: {item['question']}\nAnswer: {item['answer']}"
@@ -116,6 +122,7 @@ class EnhancedMathReasoningDataset(Dataset):
         
         target = self.extract_number(item.get('answer') or item.get('solution') or item['text'])
         
+        logger.debug(f"Processed item {idx} in {time.time() - start_time:.4f} seconds")
         return {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
@@ -129,12 +136,16 @@ class EnhancedMathReasoningDataset(Dataset):
 
 class DynamicBatchSampler:
     def __init__(self, dataset, max_tokens, max_batch_size):
+        logger.info(f"Initializing DynamicBatchSampler with max_tokens={max_tokens}, max_batch_size={max_batch_size}")
+        start_time = time.time()
         self.dataset = dataset
         self.max_tokens = max_tokens
         self.max_batch_size = max_batch_size
-        self.lengths = [len(dataset[i]['input_ids']) for i in range(len(dataset))]
+        self.lengths = [len(dataset[i]['input_ids']) for i in tqdm(range(len(dataset)), desc="Calculating lengths")]
+        logger.info(f"DynamicBatchSampler initialized in {time.time() - start_time:.2f} seconds")
 
     def __iter__(self):
+        logger.info("Starting new iteration of DynamicBatchSampler")
         indices = list(range(len(self.dataset)))
         random.shuffle(indices)
         batch = []
@@ -143,10 +154,12 @@ class DynamicBatchSampler:
             batch.append(idx)
             batch_size += self.lengths[idx]
             if batch_size >= self.max_tokens or len(batch) >= self.max_batch_size:
+                logger.debug(f"Yielding batch of size {len(batch)} with {batch_size} tokens")
                 yield batch
                 batch = []
                 batch_size = 0
         if batch:
+            logger.debug(f"Yielding final batch of size {len(batch)} with {batch_size} tokens")
             yield batch
 
     def __len__(self):
@@ -157,7 +170,6 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-        
 
     def forward(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
@@ -504,68 +516,70 @@ class DistillationTrainer:
             logger.info(f"Increased sequence length to {self.current_seq_length}")
 
 def setup_data_and_model(config):
-    # Load custom tokenizer
+    logger.info("Starting setup_data_and_model")
+    start_time = time.time()
+
     tokenizer = load_tokenizer(config)
     
-    # Set padding token if it's not already set
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    logger.info(f"Custom tokenizer loaded with vocabulary size: {len(tokenizer)}")
-
+    logger.info("Loading datasets")
     datasets = {
-        #'gsm8k': load_dataset("gsm8k", "main"),
-        'numina_cot': load_dataset("AI-MO/NuminaMath-CoT"),
-        #'numina_tir': load_dataset("AI-MO/NuminaMath-TIR"),
+        'numina_cot': load_dataset("AI-MO/NuminaMath-CoT")
     }
 
     processed_datasets = {}
     for name, dataset in datasets.items():
         logger.info(f"Processing {name} dataset")
         try:
+            start_process_time = time.time()
             processed_datasets[name] = EnhancedMathReasoningDataset(dataset['train'], tokenizer, max_length=config.n_positions)
-            logger.info(f"{name} dataset processed. Size: {len(processed_datasets[name])}")
+            logger.info(f"{name} dataset processed in {time.time() - start_process_time:.2f} seconds. Size: {len(processed_datasets[name])}")
         except Exception as e:
             logger.error(f"Error processing {name} dataset: {e}")
             continue
 
     train_loaders, val_loaders = {}, {}
     for name, dataset in processed_datasets.items():
+        logger.info(f"Creating data loaders for {name}")
+        start_loader_time = time.time()
         train_size = int(0.9 * len(dataset))
         train_dataset, val_dataset = random_split(dataset, [train_size, len(dataset) - train_size])
         
-        logger.info(f"Creating data loaders for {name}. Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
+        logger.info(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
         
         try:
+            logger.info("Initializing train sampler")
             train_sampler = DynamicBatchSampler(train_dataset, max_tokens=config.max_tokens_per_batch, max_batch_size=config.max_batch_size)
+            logger.info("Initializing validation sampler")
             val_sampler = DynamicBatchSampler(val_dataset, max_tokens=config.max_tokens_per_batch, max_batch_size=config.max_batch_size)
             
+            logger.info("Creating DataLoader for train dataset")
             train_loaders[name] = DataLoader(train_dataset, batch_sampler=train_sampler)
+            logger.info("Creating DataLoader for validation dataset")
             val_loaders[name] = DataLoader(val_dataset, batch_sampler=val_sampler)
             
-            logger.info(f"Data loaders created for {name}")
+            logger.info(f"Data loaders created for {name} in {time.time() - start_loader_time:.2f} seconds")
         except Exception as e:
             logger.error(f"Error creating data loaders for {name}: {e}")
             continue
 
-    config.vocab_size = len(tokenizer)
     logger.info(f"Initializing model with vocab size: {config.vocab_size}")
-    
     model = EnhancedPEERLanguageModel(config, config.n_experts, config.n_heads, config.top_k, config.d_key, share_params=config.share_params)
     
-    # Load the teacher model using SafeTensors
+    logger.info("Loading teacher model")
     safetensor_files = [f for f in os.listdir() if f.endswith('.safetensors')]
-    safetensor_files.sort()  # Ensure consistent ordering
-    
+    safetensor_files.sort()
     if len(safetensor_files) != 3:
         raise ValueError(f"Found {len(safetensor_files)} SafeTensors files. Expected exactly 3.")
-    
     logger.info(f"Found SafeTensors files: {', '.join(safetensor_files)}")
     teacher_model = TeacherModel(safetensor_files)
 
+    logger.info(f"setup_data_and_model completed in {time.time() - start_time:.2f} seconds")
     return model, teacher_model, tokenizer, train_loaders, val_loaders
 
 def main():
+    logger.info("Starting main function")
+    start_time = time.time()
+
     # Load configuration from YAML file
     with open('config.yaml', 'r') as f:
         config = yaml.safe_load(f)
@@ -589,12 +603,13 @@ def main():
     else:
         config.max_tokens_per_batch = 1024  # Default value for CPU
 
+    logger.info("Setting up data and model")
     model, teacher_model, tokenizer, train_loaders, val_loaders = setup_data_and_model(config)
     model = model.to(device)
     teacher_model = teacher_model.to(device)
 
     for dataset in config.datasets:
-        logger.info(f"Training on {dataset} dataset...")
+        logger.info(f"Starting training on {dataset} dataset")
         train_loader = train_loaders[dataset]
         val_loader = val_loaders[dataset]
 
@@ -608,19 +623,29 @@ def main():
         )
 
         checkpoint_path = f'{config.checkpoint_dir}/checkpoint_{dataset}_latest.pth'
-        start_epoch = trainer.load_checkpoint(checkpoint_path) if os.path.exists(checkpoint_path) else 0
+        if os.path.exists(checkpoint_path):
+            logger.info(f"Loading checkpoint: {checkpoint_path}")
+            start_epoch = trainer.load_checkpoint(checkpoint_path)
+        else:
+            logger.info("No checkpoint found, starting from epoch 0")
+            start_epoch = 0
 
+        logger.info(f"Training for {config.num_epochs[dataset] - start_epoch} epochs")
         trainer.train(config.num_epochs[dataset] - start_epoch)
 
         val_loss, val_mse, val_accuracy = trainer.validate()
         logger.info(f"Validation after {dataset} - Loss: {val_loss:.4f}, MSE: {val_mse:.4f}, Accuracy: {val_accuracy:.4f}")
 
+        logger.info(f"Saving model after training on {dataset}")
         torch.save(model.state_dict(), f'{config.checkpoint_dir}/model_after_{dataset}.pth')
 
     final_loss, final_mse, final_accuracy = trainer.validate()
     logger.info(f"Final Validation - Loss: {final_loss:.4f}, MSE: {final_mse:.4f}, Accuracy: {final_accuracy:.4f}")
 
+    logger.info("Saving final model")
     torch.save(model.state_dict(), f'{config.checkpoint_dir}/final_math_model.pth')
+
+    logger.info(f"Main function completed in {time.time() - start_time:.2f} seconds")
 
 if __name__ == "__main__":
     main()
