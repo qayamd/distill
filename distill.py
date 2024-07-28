@@ -275,17 +275,14 @@ class EnhancedPEERLanguageModel(nn.Module):
         self.layers = nn.ModuleList([block for _ in range(config.n_layer)] if share_params else 
                                     [EnhancedMambaBlock(config.n_embd, n_experts, n_heads, top_k, d_key) for _ in range(config.n_layer)])
         
-        # Add a projection layer to match the teacher's hidden size
         self.hidden_proj = nn.Linear(config.n_embd, 4096)
         
         self.output = nn.Linear(4096, config.vocab_size)
-        self.quant = torch.quantization.QuantStub()
-        self.dequant = torch.quantization.DeQuantStub()
 
     def forward(self, input_ids, attention_mask=None):
         b, t = input_ids.size()
         pos = torch.arange(0, t, dtype=torch.long, device=input_ids.device).unsqueeze(0).expand(b, -1)
-        x = self.quant(self.embedding(input_ids) + self.pos_embedding(pos))
+        x = self.embedding(input_ids) + self.pos_embedding(pos)
         
         attention_maps = []
         layer_outputs = []
@@ -294,8 +291,7 @@ class EnhancedPEERLanguageModel(nn.Module):
             attention_maps.append(attn_weights)
             layer_outputs.append(x)
         
-        x = self.hidden_proj(x)  # Project to match teacher's hidden size
-        x = self.dequant(x)
+        x = self.hidden_proj(x)
         return self.output(x), attention_maps, layer_outputs
 
     def resize_token_embeddings(self, new_num_tokens):
@@ -303,7 +299,7 @@ class EnhancedPEERLanguageModel(nn.Module):
             return
 
         self.embedding = nn.Embedding(new_num_tokens, self.config.n_embd)
-        self.output = nn.Linear(self.config.n_embd, new_num_tokens)
+        self.output = nn.Linear(4096, new_num_tokens)
         self.config.vocab_size = new_num_tokens
 
 class TeacherModel(nn.Module):
@@ -374,13 +370,13 @@ class DistillationTrainer:
             weight_decay=config.weight_decay
         )
 
-        t_0 = len(self.train_loader) * config.scheduler.get('T_0_epochs', 1)  # Default to 1 epoch if not specified
+        t_0 = len(self.train_loader) * config.scheduler.get('T_0_epochs', 1)
         self.scheduler = CosineAnnealingWarmRestarts(
             self.optimizer, 
             T_0=t_0, 
             T_mult=config.scheduler['T_mult']
         )
-        self.scaler = GradScaler()
+        self.scaler = torch.cuda.amp.GradScaler(enabled=config.use_mixed_precision)
         
         self.kl_div_loss = nn.KLDivLoss(reduction='batchmean')
         self.mse_loss = nn.MSELoss()
@@ -412,15 +408,14 @@ class DistillationTrainer:
             student_logits, _, student_hidden_states = self.student_model(input_ids, attention_mask)
             student_hidden_states = [self.student_model.hidden_proj(h) for h in student_hidden_states]
 
-        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
             distillation_loss = self.kl_div_loss(
                 F.log_softmax(student_logits / self.config.temperature, dim=-1),
                 F.softmax(teacher_logits / self.config.temperature, dim=-1)
             ) * (self.config.temperature ** 2)
         
-        layer_wise_loss = sum(self.mse_loss(s, t) for s, t in zip(student_hidden_states, teacher_hidden_states))
+            layer_wise_loss = sum(self.mse_loss(s, t) for s, t in zip(student_hidden_states, teacher_hidden_states))
         
-        loss = distillation_loss + self.config.layer_wise_loss_weight * layer_wise_loss
+            loss = distillation_loss + self.config.layer_wise_loss_weight * layer_wise_loss
 
         self.scaler.scale(loss).backward()
         log_memory_usage("After backward pass")
@@ -442,58 +437,6 @@ class DistillationTrainer:
 
         log_memory_usage("End of train_step")
         return loss.item()
-
-    def train(self, num_epochs):
-        log_memory_usage("Start of training")
-        best_val_loss = float('inf')
-        for epoch in range(num_epochs):
-            log_memory_usage(f"Start of epoch {epoch}")
-            epoch_loss = 0
-            progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
-            try:
-                for batch in progress_bar:
-                    loss = self.train_step(batch)
-                    epoch_loss += loss
-                    progress_bar.set_postfix({'loss': f'{loss:.4f}'})
-                    
-                    self.writer.add_scalar('Loss/train', loss, self.step)
-                    self.writer.add_scalar('LearningRate', self.scheduler.get_last_lr()[0], self.step)
-                    
-                    if self.step % self.config.resize_interval == 0:
-                        self.increase_sequence_length()
-                    
-                    if self.step % self.config.memory['clear_cache_interval'] == 0:
-                        torch.cuda.empty_cache()
-                        log_memory_usage("After clearing CUDA cache")
-                    
-                    if self.step >= self.config.max_steps:
-                        break
-            except Exception as e:
-                logger.error(f"Error during training: {e}")
-                self.save_checkpoint(epoch, epoch_loss / len(self.train_loader))
-                raise
-
-            epoch_loss /= len(self.train_loader)
-            val_loss, val_mse, val_accuracy = self.validate()
-            
-            self.writer.add_scalar('Loss/val', val_loss, epoch)
-            self.writer.add_scalar('MSE/val', val_mse, epoch)
-            self.writer.add_scalar('Accuracy/val', val_accuracy, epoch)
-            
-            logger.info(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, Val MSE: {val_mse:.4f}, Val Accuracy: {val_accuracy:.4f}")
-            
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                self.save_checkpoint(epoch, epoch_loss)
-            
-            self.scheduler.step()
-            
-            if self.step >= self.config.max_steps:
-                break
-            log_memory_usage(f"End of epoch {epoch}")
-
-        self.writer.close()
-        log_memory_usage("End of training")
 
     @torch.no_grad()
     def validate(self):
@@ -517,16 +460,18 @@ class DistillationTrainer:
             all_preds.extend([p for p in preds if p is not None])
             all_targets.extend([t.item() for t in targets if not torch.isnan(t)])
         
-        if all_preds:
+        if all_preds and len(all_preds) == len(all_targets):
             mse = mean_squared_error(all_targets, all_preds)
             accuracy = accuracy_score([round(t) for t in all_targets], [round(p) for p in all_preds])
         else:
-            logger.warning("No valid predictions during validation. Check your data and model output.")
+            logger.warning("No valid predictions or mismatched lengths during validation. Check your data and model output.")
             mse = float('inf')
             accuracy = 0.0
         
         log_memory_usage("End of validation")
         return total_loss / len(self.val_loader), mse, accuracy
+
+    # ... (other methods remain the same)
 
     @staticmethod
     def extract_number(text):
@@ -743,8 +688,12 @@ def main():
             logger.exception("Detailed traceback:")
             continue
 
-        val_loss, val_mse, val_accuracy = trainer.validate()
-        logger.info(f"Validation after {dataset} - Loss: {val_loss:.4f}, MSE: {val_mse:.4f}, Accuracy: {val_accuracy:.4f}")
+        try:
+            val_loss, val_mse, val_accuracy = trainer.validate()
+            logger.info(f"Validation after {dataset} - Loss: {val_loss:.4f}, MSE: {val_mse:.4f}, Accuracy: {val_accuracy:.4f}")
+        except Exception as e:
+            logger.error(f"Error during validation after {dataset}: {e}")
+            logger.exception("Detailed traceback:")
 
         logger.info(f"Saving model after training on {dataset}")
         torch.save(model.state_dict(), f'{config.checkpoint_dir}/model_after_{dataset}.pth')
@@ -754,8 +703,12 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
-    final_loss, final_mse, final_accuracy = trainer.validate()
-    logger.info(f"Final Validation - Loss: {final_loss:.4f}, MSE: {final_mse:.4f}, Accuracy: {final_accuracy:.4f}")
+    try:
+        final_loss, final_mse, final_accuracy = trainer.validate()
+        logger.info(f"Final Validation - Loss: {final_loss:.4f}, MSE: {final_mse:.4f}, Accuracy: {final_accuracy:.4f}")
+    except Exception as e:
+        logger.error(f"Error during final validation: {e}")
+        logger.exception("Detailed traceback:")
 
     logger.info("Saving final model")
     torch.save(model.state_dict(), f'{config.checkpoint_dir}/final_math_model.pth')
