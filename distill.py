@@ -15,6 +15,7 @@ import yaml
 import json
 import logging
 import time
+import gc
 from sklearn.metrics import accuracy_score, mean_squared_error
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.tensorboard import SummaryWriter
@@ -36,6 +37,10 @@ def log_memory_usage(message: str, device: Optional[torch.device] = None):
     logging.info(f"Allocated: {torch.cuda.memory_allocated(device) / 1e9:.2f}GB")
     logging.info(f"Cached: {torch.cuda.memory_reserved(device) / 1e9:.2f}GB")
     logging.info(f"Max allocated: {torch.cuda.max_memory_allocated(device) / 1e9:.2f}GB")
+    
+    # Force garbage collection
+    gc.collect()
+    torch.cuda.empty_cache()
 
 def load_tokenizer(config):
     logger.info("Starting to load tokenizer")
@@ -71,13 +76,18 @@ def load_tokenizer(config):
         tokenizer.chat_template = tokenizer_config['chat_template']
 
     # Ensure all necessary tokens are set
+    special_tokens_to_add = {}
     if tokenizer.unk_token is None:
         logger.warning("UNK token is not set. Setting it to '<unk>'.")
-        tokenizer.add_special_tokens({'unk_token': '<unk>'})
+        special_tokens_to_add['unk_token'] = '<unk>'
 
     if tokenizer.pad_token is None:
         logger.warning("PAD token is not set. Setting it to tokenizer.eos_token.")
-        tokenizer.pad_token = tokenizer.eos_token
+        special_tokens_to_add['pad_token'] = tokenizer.eos_token
+
+    if special_tokens_to_add:
+        num_added = tokenizer.add_special_tokens(special_tokens_to_add)
+        logger.info(f"Added {num_added} special tokens to the tokenizer.")
 
     # Log tokenizer information
     logger.info(f"Tokenizer loaded: vocabulary size = {len(tokenizer)}, max length = {tokenizer.model_max_length}")
@@ -90,7 +100,7 @@ def load_tokenizer(config):
     logger.info(f"EOS token is set: {tokenizer.eos_token is not None}")
 
     logger.info(f"Tokenizer loaded in {time.time() - start_time:.2f} seconds")
-    return tokenizer
+    return tokenizer, num_added
 
 class EnhancedMathReasoningDataset(Dataset):
     def __init__(self, dataset, tokenizer, max_length):
@@ -352,12 +362,16 @@ class DistillationTrainer:
         self.optimizer = AdamW(
             self.student_model.parameters(),
             lr=float(config.learning_rate),
-            betas=(0.9, 0.999),
-            eps=1e-8,
+            betas=config.optimizer['betas'],
+            eps=config.optimizer['eps'],
             weight_decay=config.weight_decay
         )
 
-        self.scheduler = CosineAnnealingWarmRestarts(self.optimizer, T_0=config.T_0, T_mult=config.T_mult)
+        self.scheduler = CosineAnnealingWarmRestarts(
+            self.optimizer, 
+            T_0=len(self.train_loader) * config.scheduler['T_0_epochs'], 
+            T_mult=config.scheduler['T_mult']
+        )
         self.scaler = GradScaler()
         
         self.kl_div_loss = nn.KLDivLoss(reduction='batchmean')
@@ -366,7 +380,7 @@ class DistillationTrainer:
         
         self.writer = SummaryWriter(log_dir=config.log_dir)
         
-        self.pruning_amount = 0.3  # Prune 30% of connections
+        self.pruning_amount = config.pruning_amount
         self.current_seq_length = config.initial_sequence_length
         self.max_seq_length = config.n_positions
         log_memory_usage("End of DistillationTrainer initialization")
@@ -386,11 +400,11 @@ class DistillationTrainer:
             teacher_logits, teacher_hidden_states = self.teacher_model(input_ids, attention_mask)
         log_memory_usage("After teacher model forward pass")
 
-        with autocast():
+        with autocast(device_type=self.config.device, dtype=torch.float16 if self.config.precision == 'float16' else torch.bfloat16):
             student_logits, _, student_hidden_states = self.student_model(input_ids, attention_mask)
         log_memory_usage("After student model forward pass")
 
-        with autocast():
+        with autocast(device_type=self.config.device, dtype=torch.float16 if self.config.precision == 'float16' else torch.bfloat16):
             distillation_loss = self.kl_div_loss(
                 F.log_softmax(student_logits / self.config.temperature, dim=-1),
                 F.softmax(teacher_logits / self.config.temperature, dim=-1)
@@ -399,8 +413,6 @@ class DistillationTrainer:
             layer_wise_loss = sum(self.mse_loss(s, t) for s, t in zip(student_hidden_states, teacher_hidden_states))
             
             loss = distillation_loss + self.config.layer_wise_loss_weight * layer_wise_loss
-            loss = loss / self.config.gradient_accumulation_steps
-        log_memory_usage("After loss computation")
 
         self.scaler.scale(loss).backward()
         log_memory_usage("After backward pass")
@@ -410,13 +422,18 @@ class DistillationTrainer:
             torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), self.config.grad_clip)
             self.scaler.step(self.optimizer)
             self.scaler.update()
-            self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
+            loss = loss / self.config.gradient_accumulation_steps
             log_memory_usage("After optimizer step")
 
         self.step += 1
+
+        if self.step % self.config.memory['clear_cache_interval'] == 0:
+            torch.cuda.empty_cache()
+            log_memory_usage("After clearing CUDA cache")
+
         log_memory_usage("End of train_step")
-        return loss.item() * self.config.gradient_accumulation_steps
+        return loss.item()
 
     def train(self, num_epochs):
         log_memory_usage("Start of training")
@@ -425,19 +442,24 @@ class DistillationTrainer:
             log_memory_usage(f"Start of epoch {epoch}")
             epoch_loss = 0
             progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
-            for batch in progress_bar:
-                loss = self.train_step(batch)
-                epoch_loss += loss
-                progress_bar.set_postfix({'loss': f'{loss:.4f}'})
-                
-                self.writer.add_scalar('Loss/train', loss, self.step)
-                self.writer.add_scalar('LearningRate', self.scheduler.get_last_lr()[0], self.step)
-                
-                if self.step % self.config.resize_interval == 0:
-                    self.increase_sequence_length()
-                
-                if self.step >= self.config.max_steps:
-                    break
+            try:
+                for batch in progress_bar:
+                    loss = self.train_step(batch)
+                    epoch_loss += loss
+                    progress_bar.set_postfix({'loss': f'{loss:.4f}'})
+                    
+                    self.writer.add_scalar('Loss/train', loss, self.step)
+                    self.writer.add_scalar('LearningRate', self.scheduler.get_last_lr()[0], self.step)
+                    
+                    if self.step % self.config.resize_interval == 0:
+                        self.increase_sequence_length()
+                    
+                    if self.step >= self.config.max_steps:
+                        break
+            except Exception as e:
+                logger.error(f"Error during training: {e}")
+                self.save_checkpoint(epoch, epoch_loss / len(self.train_loader))
+                raise
 
             epoch_loss /= len(self.train_loader)
             val_loss, val_mse, val_accuracy = self.validate()
@@ -451,6 +473,8 @@ class DistillationTrainer:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 self.save_checkpoint(epoch, epoch_loss)
+            
+            self.scheduler.step()
             
             if self.step >= self.config.max_steps:
                 break
@@ -481,8 +505,13 @@ class DistillationTrainer:
             all_preds.extend([p for p in preds if p is not None])
             all_targets.extend([t.item() for t in targets if not torch.isnan(t)])
         
-        mse = mean_squared_error(all_targets, all_preds) if all_preds else float('inf')
-        accuracy = accuracy_score([round(t) for t in all_targets], [round(p) for p in all_preds]) if all_preds else 0.0
+        if all_preds:
+            mse = mean_squared_error(all_targets, all_preds)
+            accuracy = accuracy_score([round(t) for t in all_targets], [round(p) for p in all_preds])
+        else:
+            logger.warning("No valid predictions during validation. Check your data and model output.")
+            mse = float('inf')
+            accuracy = 0.0
         
         log_memory_usage("End of validation")
         return total_loss / len(self.val_loader), mse, accuracy
@@ -515,7 +544,7 @@ class DistillationTrainer:
 
     def adaptive_layer_freezing(self):
         num_layers = len(self.student_model.layers)
-        layers_to_freeze = int(num_layers * (1 - self.step / self.config.max_steps))
+        layers_to_freeze = max(0, self.config.initial_frozen_layers - (self.step // self.config.unfreeze_interval))
         
         for i, layer in enumerate(self.student_model.layers):
             for param in layer.parameters():
@@ -534,7 +563,7 @@ def setup_data_and_model(config):
     logger.info("Starting setup_data_and_model")
     start_time = time.time()
 
-    tokenizer = load_tokenizer(config)
+    tokenizer, num_added_tokens = load_tokenizer(config)
     log_memory_usage("After loading tokenizer")
     
     config.vocab_size = len(tokenizer)
@@ -594,6 +623,12 @@ def setup_data_and_model(config):
     log_memory_usage("Before initializing student model")
     logger.info(f"Initializing student model with vocab size: {config.vocab_size}")
     model = EnhancedPEERLanguageModel(config, config.n_experts, config.n_heads, config.top_k, config.d_key, share_params=config.share_params)
+    
+    # Resize model embeddings if new tokens were added
+    if num_added_tokens > 0:
+        model.resize_token_embeddings(config.vocab_size)
+        logger.info(f"Resized model embeddings to {config.vocab_size}")
+    
     log_memory_usage("After initializing student model")
     log_memory_usage("Before loading teacher model")
     logger.info("Loading teacher model")
@@ -628,18 +663,17 @@ def main():
     # Set up logging
     os.makedirs(config.log_dir, exist_ok=True)
     os.makedirs(config.checkpoint_dir, exist_ok=True)
+    if config.logging['log_to_file']:
+        file_handler = logging.FileHandler(config.logging['log_file'])
+        file_handler.setLevel(getattr(logging, config.logging['level']))
+        logger.addHandler(file_handler)
     
     # Set random seeds for reproducibility
     torch.manual_seed(config.seed)
     random.seed(config.seed)
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(config.device)
     config.device = device
-    if torch.cuda.is_available():
-        total_gpu_memory = torch.cuda.get_device_properties(device).total_memory
-        config.max_tokens_per_batch = int(1024**2)
-    else:
-        config.max_tokens_per_batch = 1024  # Default value for CPU
 
     log_memory_usage("Before setup_data_and_model")
     logger.info("Setting up data and model")
@@ -680,6 +714,10 @@ def main():
         logger.info(f"Saving model after training on {dataset}")
         torch.save(model.state_dict(), f'{config.checkpoint_dir}/model_after_{dataset}.pth')
         log_memory_usage(f"After training on {dataset} dataset")
+
+        # Force garbage collection and clear CUDA cache
+        gc.collect()
+        torch.cuda.empty_cache()
 
     final_loss, final_mse, final_accuracy = trainer.validate()
     logger.info(f"Final Validation - Loss: {final_loss:.4f}, MSE: {final_mse:.4f}, Accuracy: {final_accuracy:.4f}")
