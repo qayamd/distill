@@ -498,6 +498,7 @@ class DistillationTrainer:
                         log_memory_usage("After clearing CUDA cache")
                     
                     if self.step >= self.max_steps:
+                        logger.info(f"Reached max_steps ({self.max_steps}) at epoch {epoch+1}")
                         break
 
                 val_loss, val_mse, val_accuracy = self.validate()
@@ -518,6 +519,7 @@ class DistillationTrainer:
                 raise
             
             if self.step >= self.max_steps:
+                logger.info(f"Reached max_steps ({self.max_steps}). Stopping training.")
                 break
 
         self.writer.close()
@@ -549,7 +551,7 @@ class DistillationTrainer:
             mse = mean_squared_error(all_targets, all_preds)
             accuracy = accuracy_score([round(t) for t in all_targets], [round(p) for p in all_preds])
         else:
-            logger.warning("No valid predictions or mismatched lengths during validation. Check your data and model output.")
+            logger.warning(f"Validation: No valid predictions or mismatched lengths. Preds: {len(all_preds)}, Targets: {len(all_targets)}")
             mse = float('inf')
             accuracy = 0.0
         
@@ -567,7 +569,7 @@ class DistillationTrainer:
             'epoch': epoch,
             'model_state_dict': self.student_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
+            'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),  
             'loss': loss,
             'step': self.step,
         }, checkpoint_path)
