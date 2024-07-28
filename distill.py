@@ -23,6 +23,8 @@ from safetensors.torch import load_file
 from itertools import islice
 from typing import Optional
 from torch.optim import AdamW
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -79,7 +81,7 @@ def load_tokenizer(config):
     # Ensure all necessary tokens are set
     special_tokens_to_add = {}
     if tokenizer.unk_token is None:
-        logger.warning("UNK token is not set. Setting it to '<unk>'.")
+        logger.info("UNK token was not set. It has been explicitly set to '<unk>'.")
         special_tokens_to_add['unk_token'] = '<unk>'
 
     if tokenizer.pad_token is None:
@@ -402,11 +404,11 @@ class DistillationTrainer:
             teacher_logits, teacher_hidden_states = self.teacher_model(input_ids, attention_mask)
         log_memory_usage("After teacher model forward pass")
 
-        with autocast(device_type=self.config.device, dtype=torch.float16 if self.config.precision == 'float16' else torch.bfloat16):
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
             student_logits, _, student_hidden_states = self.student_model(input_ids, attention_mask)
         log_memory_usage("After student model forward pass")
 
-        with autocast(device_type=self.config.device, dtype=torch.float16 if self.config.precision == 'float16' else torch.bfloat16):
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
             distillation_loss = self.kl_div_loss(
                 F.log_softmax(student_logits / self.config.temperature, dim=-1),
                 F.softmax(teacher_logits / self.config.temperature, dim=-1)
@@ -455,6 +457,10 @@ class DistillationTrainer:
                     
                     if self.step % self.config.resize_interval == 0:
                         self.increase_sequence_length()
+                    
+                    if self.step % self.config.memory['clear_cache_interval'] == 0:
+                        torch.cuda.empty_cache()
+                        log_memory_usage("After clearing CUDA cache")
                     
                     if self.step >= self.config.max_steps:
                         break
@@ -726,7 +732,12 @@ def main():
             start_epoch = 0
 
         logger.info(f"Training for {config.num_epochs[dataset] - start_epoch} epochs")
-        trainer.train(config.num_epochs[dataset] - start_epoch)
+        try:
+            trainer.train(config.num_epochs[dataset] - start_epoch)
+        except Exception as e:
+            logger.error(f"Error during training on {dataset}: {e}")
+            logger.exception("Detailed traceback:")
+            continue
 
         val_loss, val_mse, val_accuracy = trainer.validate()
         logger.info(f"Validation after {dataset} - Loss: {val_loss:.4f}, MSE: {val_mse:.4f}, Accuracy: {val_accuracy:.4f}")
