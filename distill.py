@@ -117,7 +117,7 @@ class EnhancedMathReasoningDataset(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        log_memory_usage(f"Start of __getitem__ for index {idx}")
+        #log_memory_usage(f"Start of __getitem__ for index {idx}")
         start_time = time.time()
         item = self.dataset[idx]
         if 'question' in item:  # GSM8K format
