@@ -73,9 +73,9 @@ tokenizer_config_path: './tokenizer_config.json'
 teacher_model_name: "numina7b"
 teacher_batch_size: 8
 teacher_model:
-  files: ["path/to/model-00001-of-00003.safetensors", 
-          "path/to/model-00002-of-00003.safetensors", 
-          "path/to/model-00003-of-00003.safetensors"]
+  files: ["./model-00001-of-00003.safetensors", 
+          "./model-00002-of-00003.safetensors", 
+          "./model-00003-of-00003.safetensors"]
 
 # Evaluation
 eval_interval: 1000
