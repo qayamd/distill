@@ -275,7 +275,10 @@ class EnhancedPEERLanguageModel(nn.Module):
         self.layers = nn.ModuleList([block for _ in range(config.n_layer)] if share_params else 
                                     [EnhancedMambaBlock(config.n_embd, n_experts, n_heads, top_k, d_key) for _ in range(config.n_layer)])
         
-        self.output = nn.Linear(config.n_embd, config.vocab_size)
+        # Add a projection layer to match the teacher's hidden size
+        self.hidden_proj = nn.Linear(config.n_embd, 4096)
+        
+        self.output = nn.Linear(4096, config.vocab_size)
         self.quant = torch.quantization.QuantStub()
         self.dequant = torch.quantization.DeQuantStub()
 
@@ -291,6 +294,7 @@ class EnhancedPEERLanguageModel(nn.Module):
             attention_maps.append(attn_weights)
             layer_outputs.append(x)
         
+        x = self.hidden_proj(x)  # Project to match teacher's hidden size
         x = self.dequant(x)
         return self.output(x), attention_maps, layer_outputs
 
@@ -406,17 +410,17 @@ class DistillationTrainer:
 
         with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
             student_logits, _, student_hidden_states = self.student_model(input_ids, attention_mask)
-        log_memory_usage("After student model forward pass")
+            student_hidden_states = [self.student_model.hidden_proj(h) for h in student_hidden_states]
 
         with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
             distillation_loss = self.kl_div_loss(
                 F.log_softmax(student_logits / self.config.temperature, dim=-1),
                 F.softmax(teacher_logits / self.config.temperature, dim=-1)
             ) * (self.config.temperature ** 2)
-            
-            layer_wise_loss = sum(self.mse_loss(s, t) for s, t in zip(student_hidden_states, teacher_hidden_states))
-            
-            loss = distillation_loss + self.config.layer_wise_loss_weight * layer_wise_loss
+        
+        layer_wise_loss = sum(self.mse_loss(s, t) for s, t in zip(student_hidden_states, teacher_hidden_states))
+        
+        loss = distillation_loss + self.config.layer_wise_loss_weight * layer_wise_loss
 
         self.scaler.scale(loss).backward()
         log_memory_usage("After backward pass")
@@ -502,9 +506,9 @@ class DistillationTrainer:
             attention_mask = batch['attention_mask'].to(self.config.device)
             targets = batch['target'].to(self.config.device)
             
-            with autocast():
+            with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
                 student_logits, _, _ = self.student_model(input_ids, attention_mask)
-                loss = F.cross_entropy(student_logits.view(-1, student_logits.size(-1)), targets.view(-1))
+                loss = F.cross_entropy(student_logits.view(-1, student_logits.size(-1)), input_ids.view(-1))
             total_loss += loss.item()
             
             pred_tokens = student_logits.argmax(dim=-1)
