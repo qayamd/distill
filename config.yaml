@@ -62,7 +62,7 @@ datasets:
   - numina_cot
   - gsm8k
 num_epochs:
-  numina_cot: 10 
+  numina_cot: 5 
   gsm8k: 2
 
 # Paths
