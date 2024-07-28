@@ -141,7 +141,7 @@ class EnhancedMathReasoningDataset(Dataset):
         target = self.extract_number(item.get('answer') or item.get('solution') or item['text'])
         
         logger.debug(f"Processed item {idx} in {time.time() - start_time:.4f} seconds")
-        log_memory_usage(f"End of __getitem__ for index {idx}")
+        #log_memory_usage(f"End of __getitem__ for index {idx}")
         return {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
