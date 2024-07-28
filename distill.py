@@ -155,7 +155,11 @@ class EnhancedMathReasoningDataset(Dataset):
     @staticmethod
     def extract_number(text):
         match = re.search(r'-?\d+\.?\d*', text.split('\n')[-1])
-        return float(match.group()) if match else None
+        if match:
+            return float(match.group())
+        else:
+            logger.debug(f"Failed to extract number from: {text}")
+            return None
 
 class DynamicBatchSampler:
     def __init__(self, dataset, max_tokens, max_batch_size):
@@ -433,6 +437,12 @@ class DistillationTrainer:
             student_logits, _, student_hidden_states = self.student_model(input_ids, attention_mask)
             student_hidden_states = [self.student_model.hidden_proj(h) for h in student_hidden_states]
 
+            # Debug: Print information about logits
+            logger.debug(f"Student logits shape: {student_logits.shape}")
+            logger.debug(f"Student logits max: {student_logits.max().item()}, min: {student_logits.min().item()}")
+            logger.debug(f"Teacher logits shape: {teacher_logits.shape}")
+            logger.debug(f"Teacher logits max: {teacher_logits.max().item()}, min: {teacher_logits.min().item()}")
+
             # Scale down the logits to prevent extreme values
             student_logits = student_logits / 10
             teacher_logits = teacher_logits / 10
@@ -445,6 +455,10 @@ class DistillationTrainer:
             layer_wise_loss = sum(self.layer_wise_loss(s, t) for s, t in zip(student_hidden_states, teacher_hidden_states))
         
             loss = distillation_loss + self.config.layer_wise_loss_weight * layer_wise_loss
+
+            # Debug: Print loss components
+            logger.debug(f"Distillation loss: {distillation_loss.item()}")
+            logger.debug(f"Layer-wise loss: {layer_wise_loss.item()}")
 
         # Scale the loss
         loss = loss / 100  # Adjust this scaling factor as needed
@@ -542,10 +556,20 @@ class DistillationTrainer:
             total_loss += loss.item()
             
             pred_tokens = student_logits.argmax(dim=-1)
+            
+            # Debug: Print some information about the predictions
+            logger.debug(f"Pred tokens shape: {pred_tokens.shape}")
+            logger.debug(f"First prediction: {self.tokenizer.decode(pred_tokens[0])}")
+            
             preds = [self.extract_number(self.tokenizer.decode(tokens)) for tokens in pred_tokens]
+            
+            # Debug: Print information about extracted numbers
+            logger.debug(f"Extracted numbers: {preds[:5]}")
             
             all_preds.extend([p for p in preds if p is not None])
             all_targets.extend([t.item() for t in targets if not torch.isnan(t)])
+        
+        logger.info(f"Validation: Preds: {len(all_preds)}, Targets: {len(all_targets)}")
         
         if all_preds and len(all_preds) == len(all_targets):
             mse = mean_squared_error(all_targets, all_preds)
