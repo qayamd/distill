@@ -1,7 +1,7 @@
 # Model configuration
 n_layer: 24
 n_embd: 1024
-n_experts: 8192
+n_experts: 16384
 n_heads: 16
 top_k: 16
 d_key: 64
@@ -13,14 +13,14 @@ n_kv_heads: 16
 # Training configuration
 learning_rate: 1e-5
 warmup_steps: 5000
-max_steps: 200000
+max_steps: 50000
 grad_clip: 0.5
-max_batch_size: 16
-gradient_accumulation_steps: 4
+max_batch_size: 32
+gradient_accumulation_steps: 8
 weight_decay: 0.01
 model_sharding: true
 num_shards: 3
-subset_size: 1000
+subset_size: 100000
 max_tokens_per_batch: 4096
 
 # Optimizer
@@ -59,7 +59,7 @@ datasets:
   - numina_cot
   - gsm8k
 num_epochs:
-  numina_cot: 10
+  numina_cot: 3
   gsm8k: 2
 
 # Paths
