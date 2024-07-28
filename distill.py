@@ -571,17 +571,19 @@ def setup_data_and_model(config):
 
     logger.info("Loading datasets")
     datasets = {
-        'numina_cot': load_dataset("AI-MO/NuminaMath-CoT")
+        'numina_cot': load_dataset("AI-MO/NuminaMath-CoT"),
+        'gsm8k': load_dataset("gsm8k", "main")
     }
 
     processed_datasets = {}
     for name, dataset in datasets.items():
+        logger.info(f"Loaded {name} dataset with {len(dataset['train'])} examples")
         log_memory_usage(f"Before processing {name} dataset")
         logger.info(f"Processing {name} dataset")
         try:
             start_process_time = time.time()
             
-            if hasattr(config, 'subset_size') and config.subset_size > 0:
+            if config.subset_size > 0:
                 subset_size = min(config.subset_size, len(dataset['train']))
                 logger.info(f"Using a subset of {subset_size} examples from {name} dataset")
                 subset_data = list(islice(dataset['train'], subset_size))
@@ -592,6 +594,7 @@ def setup_data_and_model(config):
             logger.info(f"{name} dataset processed in {time.time() - start_process_time:.2f} seconds. Size: {len(processed_datasets[name])}")
         except Exception as e:
             logger.error(f"Error processing {name} dataset: {e}")
+            logger.exception("Detailed traceback:")
             continue
         log_memory_usage(f"After processing {name} dataset")
 
@@ -599,32 +602,32 @@ def setup_data_and_model(config):
     for name, dataset in processed_datasets.items():
         logger.info(f"Creating data loaders for {name}")
         start_loader_time = time.time()
-        train_size = int(0.9 * len(dataset))
-        train_dataset, val_dataset = random_split(dataset, [train_size, len(dataset) - train_size])
-        
-        logger.info(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
-        
         try:
-            logger.info("Initializing train sampler")
+            train_size = int(0.9 * len(dataset))
+            train_dataset, val_dataset = random_split(dataset, [train_size, len(dataset) - train_size])
+            
+            logger.info(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
+            
             train_sampler = DynamicBatchSampler(train_dataset, max_tokens=config.max_tokens_per_batch, max_batch_size=config.max_batch_size)
-            logger.info("Initializing validation sampler")
             val_sampler = DynamicBatchSampler(val_dataset, max_tokens=config.max_tokens_per_batch, max_batch_size=config.max_batch_size)
             
-            logger.info("Creating DataLoader for train dataset")
-            train_loaders[name] = DataLoader(train_dataset, batch_sampler=train_sampler)
-            logger.info("Creating DataLoader for validation dataset")
-            val_loaders[name] = DataLoader(val_dataset, batch_sampler=val_sampler)
+            train_loaders[name] = DataLoader(train_dataset, batch_sampler=train_sampler, num_workers=config.dataloader['num_workers'], pin_memory=config.dataloader['pin_memory'])
+            val_loaders[name] = DataLoader(val_dataset, batch_sampler=val_sampler, num_workers=config.dataloader['num_workers'], pin_memory=config.dataloader['pin_memory'])
             
             logger.info(f"Data loaders created for {name} in {time.time() - start_loader_time:.2f} seconds")
         except Exception as e:
             logger.error(f"Error creating data loaders for {name}: {e}")
+            logger.exception("Detailed traceback:")
             continue
+
+    logger.info(f"Processed datasets: {list(processed_datasets.keys())}")
+    logger.info(f"Train loaders: {list(train_loaders.keys())}")
+    logger.info(f"Val loaders: {list(val_loaders.keys())}")
 
     log_memory_usage("Before initializing student model")
     logger.info(f"Initializing student model with vocab size: {config.vocab_size}")
     model = EnhancedPEERLanguageModel(config, config.n_experts, config.n_heads, config.top_k, config.d_key, share_params=config.share_params)
     
-    # Resize model embeddings if new tokens were added
     if num_added_tokens > 0:
         model.resize_token_embeddings(config.vocab_size)
         logger.info(f"Resized model embeddings to {config.vocab_size}")
@@ -632,14 +635,8 @@ def setup_data_and_model(config):
     log_memory_usage("After initializing student model")
     log_memory_usage("Before loading teacher model")
     logger.info("Loading teacher model")
-    safetensor_files = [f for f in os.listdir() if f.endswith('.safetensors')]
-    safetensor_files.sort()
-    if len(safetensor_files) != 3:
-        raise ValueError(f"Found {len(safetensor_files)} SafeTensors files. Expected exactly 3.")
-    logger.info(f"Found SafeTensors files: {', '.join(safetensor_files)}")
-    teacher_model = TeacherModel(safetensor_files)
+    teacher_model = TeacherModel(config.teacher_model['files'])
 
-    # Ensure the teacher model uses the same vocabulary size
     teacher_model.model.resize_token_embeddings(config.vocab_size)
     logger.info(f"Adjusted teacher model vocab size to {config.vocab_size}")
     log_memory_usage("After loading teacher model")
@@ -647,6 +644,19 @@ def setup_data_and_model(config):
     logger.info(f"setup_data_and_model completed in {time.time() - start_time:.2f} seconds")
     log_memory_usage("End of setup_data_and_model")
     return model, teacher_model, tokenizer, train_loaders, val_loaders
+
+def check_config(config):
+    required_keys = ['max_tokens_per_batch', 'max_batch_size', 'dataloader', 'subset_size']
+    for key in required_keys:
+        if not hasattr(config, key):
+            raise ValueError(f"Missing required configuration: {key}")
+    
+    if not isinstance(config.datasets, list) or len(config.datasets) == 0:
+        raise ValueError("config.datasets must be a non-empty list")
+    
+    for dataset in config.datasets:
+        if dataset not in config.num_epochs:
+            raise ValueError(f"Missing num_epochs configuration for dataset: {dataset}")
 
 def main():
     log_memory_usage("Start of main function")
@@ -659,6 +669,9 @@ def main():
     
     # Convert config to an object for easier access
     config = type('Config', (), config)()
+    
+    # Check configuration
+    check_config(config)
     
     # Set up logging
     os.makedirs(config.log_dir, exist_ok=True)
@@ -685,6 +698,11 @@ def main():
     for dataset in config.datasets:
         log_memory_usage(f"Before training on {dataset} dataset")
         logger.info(f"Starting training on {dataset} dataset")
+        
+        if dataset not in train_loaders or dataset not in val_loaders:
+            logger.error(f"Dataset '{dataset}' not found in train_loaders or val_loaders. Skipping.")
+            continue
+        
         train_loader = train_loaders[dataset]
         val_loader = val_loaders[dataset]
 
