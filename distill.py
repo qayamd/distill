@@ -368,9 +368,10 @@ class DistillationTrainer:
             weight_decay=config.weight_decay
         )
 
+        t_0 = len(self.train_loader) * config.scheduler.get('T_0_epochs', 1)  # Default to 1 epoch if not specified
         self.scheduler = CosineAnnealingWarmRestarts(
             self.optimizer, 
-            T_0=len(self.train_loader) * config.scheduler['T_0_epochs'], 
+            T_0=t_0, 
             T_mult=config.scheduler['T_mult']
         )
         self.scaler = GradScaler()
