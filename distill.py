@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Dataset, random_split
-from transformers import GPT2Config, PreTrainedTokenizerFast, AutoModelForCausalLM, AutoConfig
+from transformers import GPT2Config, PreTrainedTokenizerFast, AutoModelForCausalLM, AutoConfig, AdamW
 from datasets import load_dataset
 import datasets
 from tqdm import tqdm
@@ -18,13 +18,9 @@ import time
 from sklearn.metrics import accuracy_score, mean_squared_error
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.tensorboard import SummaryWriter
-from torch.quantization import quantize_dynamic, QuantStub, DeQuantStub
 from safetensors.torch import load_file
-from modifiedadam import Adam_mini
-import torch.nn.utils.prune as prune
-from transformers import PreTrainedTokenizerFast
-from transformers import AutoModelForCausalLM, AutoConfig
 from itertools import islice
+from typing import Optional
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,6 +28,14 @@ logger = logging.getLogger(__name__)
 
 # Set the cache directory for datasets
 datasets.config.HF_DATASETS_CACHE = "./datasets"
+
+def log_memory_usage(message: str, device: Optional[torch.device] = None):
+    if device is None:
+        device = torch.cuda.current_device()
+    logging.info(f"{message}")
+    logging.info(f"Allocated: {torch.cuda.memory_allocated(device) / 1e9:.2f}GB")
+    logging.info(f"Cached: {torch.cuda.memory_reserved(device) / 1e9:.2f}GB")
+    logging.info(f"Max allocated: {torch.cuda.max_memory_allocated(device) / 1e9:.2f}GB")
 
 def load_tokenizer(config):
     logger.info("Starting to load tokenizer")
@@ -90,17 +94,20 @@ def load_tokenizer(config):
 
 class EnhancedMathReasoningDataset(Dataset):
     def __init__(self, dataset, tokenizer, max_length):
+        log_memory_usage("Start of EnhancedMathReasoningDataset initialization")
         logger.info(f"Initializing EnhancedMathReasoningDataset with {len(dataset)} items")
         start_time = time.time()
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.max_length = max_length
         logger.info(f"EnhancedMathReasoningDataset initialized in {time.time() - start_time:.2f} seconds")
+        log_memory_usage("End of EnhancedMathReasoningDataset initialization")
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        log_memory_usage(f"Start of __getitem__ for index {idx}")
         start_time = time.time()
         item = self.dataset[idx]
         if 'question' in item:  # GSM8K format
@@ -124,6 +131,7 @@ class EnhancedMathReasoningDataset(Dataset):
         target = self.extract_number(item.get('answer') or item.get('solution') or item['text'])
         
         logger.debug(f"Processed item {idx} in {time.time() - start_time:.4f} seconds")
+        log_memory_usage(f"End of __getitem__ for index {idx}")
         return {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
@@ -284,6 +292,7 @@ class EnhancedPEERLanguageModel(nn.Module):
 class TeacherModel(nn.Module):
     def __init__(self, model_files):
         super().__init__()
+        log_memory_usage("Start of TeacherModel initialization")
         if len(model_files) != 3:
             raise ValueError(f"Expected 3 model files, but found {len(model_files)}.")
         
@@ -298,6 +307,7 @@ class TeacherModel(nn.Module):
         missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
         logger.info(f"Model loaded. Missing keys: {missing_keys}, Unexpected keys: {unexpected_keys}")
         self.model.eval()
+        log_memory_usage("End of TeacherModel initialization")
 
     def load_3part_sharded_model(self, model_files):
         state_dict = {}
@@ -308,7 +318,8 @@ class TeacherModel(nn.Module):
 
     @torch.no_grad()
     def generate(self, input_ids, attention_mask, max_length=100):
-        return self.model.generate(
+        log_memory_usage("Start of TeacherModel generate")
+        output = self.model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_length=max_length,
@@ -319,13 +330,18 @@ class TeacherModel(nn.Module):
             top_p=0.95,
             temperature=0.7
         )
+        log_memory_usage("End of TeacherModel generate")
+        return output
 
     def forward(self, input_ids, attention_mask=None):
+        log_memory_usage("Start of TeacherModel forward")
         outputs = self.model(input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        log_memory_usage("End of TeacherModel forward")
         return outputs.logits, outputs.hidden_states
 
 class DistillationTrainer:
     def __init__(self, student_model, teacher_model, train_loader, val_loader, tokenizer, config):
+        log_memory_usage("Start of DistillationTrainer initialization")
         self.student_model = student_model.to(config.device)
         self.teacher_model = teacher_model.to(config.device)
         self.train_loader = train_loader
@@ -333,16 +349,12 @@ class DistillationTrainer:
         self.tokenizer = tokenizer
         self.config = config
 
-        self.optimizer = Adam_mini(
-            model=self.student_model,
+        self.optimizer = AdamW(
+            self.student_model.parameters(),
             lr=float(config.learning_rate),
             betas=(0.9, 0.999),
             eps=1e-8,
-            weight_decay=config.weight_decay,
-            model_sharding=config.model_sharding,
-            n_feature=config.n_embd,
-            n_head=config.n_heads,
-            n_kv_head=config.n_kv_heads 
+            weight_decay=config.weight_decay
         )
 
         self.scheduler = CosineAnnealingWarmRestarts(self.optimizer, T_0=config.T_0, T_mult=config.T_mult)
@@ -357,36 +369,41 @@ class DistillationTrainer:
         self.pruning_amount = 0.3  # Prune 30% of connections
         self.current_seq_length = config.initial_sequence_length
         self.max_seq_length = config.n_positions
+        log_memory_usage("End of DistillationTrainer initialization")
 
     def train_step(self, batch):
+        log_memory_usage("Start of train_step")
         self.student_model.train()
         self.teacher_model.eval()
         
         input_ids = batch['input_ids'][:, :self.current_seq_length].to(self.config.device)
         attention_mask = batch['attention_mask'][:, :self.current_seq_length].to(self.config.device)
+        log_memory_usage("After moving batch to GPU")
 
-        # Adaptive Layer Freezing
         self.adaptive_layer_freezing()
 
         with torch.no_grad():
             teacher_logits, teacher_hidden_states = self.teacher_model(input_ids, attention_mask)
+        log_memory_usage("After teacher model forward pass")
 
         with autocast():
             student_logits, _, student_hidden_states = self.student_model(input_ids, attention_mask)
+        log_memory_usage("After student model forward pass")
 
-            # KL Divergence Loss
+        with autocast():
             distillation_loss = self.kl_div_loss(
                 F.log_softmax(student_logits / self.config.temperature, dim=-1),
                 F.softmax(teacher_logits / self.config.temperature, dim=-1)
             ) * (self.config.temperature ** 2)
-
-            # Layer-wise Distillation Loss
+            
             layer_wise_loss = sum(self.mse_loss(s, t) for s, t in zip(student_hidden_states, teacher_hidden_states))
             
             loss = distillation_loss + self.config.layer_wise_loss_weight * layer_wise_loss
             loss = loss / self.config.gradient_accumulation_steps
+        log_memory_usage("After loss computation")
 
         self.scaler.scale(loss).backward()
+        log_memory_usage("After backward pass")
         
         if (self.step + 1) % self.config.gradient_accumulation_steps == 0:
             self.scaler.unscale_(self.optimizer)
@@ -394,17 +411,57 @@ class DistillationTrainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.scheduler.step()
-            self.optimizer.zero_grad()
-
-            # Model Pruning
-            if self.step % self.config.pruning_interval == 0:
-                self.prune_model()
+            self.optimizer.zero_grad(set_to_none=True)
+            log_memory_usage("After optimizer step")
 
         self.step += 1
+        log_memory_usage("End of train_step")
         return loss.item() * self.config.gradient_accumulation_steps
+
+    def train(self, num_epochs):
+        log_memory_usage("Start of training")
+        best_val_loss = float('inf')
+        for epoch in range(num_epochs):
+            log_memory_usage(f"Start of epoch {epoch}")
+            epoch_loss = 0
+            progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+            for batch in progress_bar:
+                loss = self.train_step(batch)
+                epoch_loss += loss
+                progress_bar.set_postfix({'loss': f'{loss:.4f}'})
+                
+                self.writer.add_scalar('Loss/train', loss, self.step)
+                self.writer.add_scalar('LearningRate', self.scheduler.get_last_lr()[0], self.step)
+                
+                if self.step % self.config.resize_interval == 0:
+                    self.increase_sequence_length()
+                
+                if self.step >= self.config.max_steps:
+                    break
+
+            epoch_loss /= len(self.train_loader)
+            val_loss, val_mse, val_accuracy = self.validate()
+            
+            self.writer.add_scalar('Loss/val', val_loss, epoch)
+            self.writer.add_scalar('MSE/val', val_mse, epoch)
+            self.writer.add_scalar('Accuracy/val', val_accuracy, epoch)
+            
+            logger.info(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, Val MSE: {val_mse:.4f}, Val Accuracy: {val_accuracy:.4f}")
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                self.save_checkpoint(epoch, epoch_loss)
+            
+            if self.step >= self.config.max_steps:
+                break
+            log_memory_usage(f"End of epoch {epoch}")
+
+        self.writer.close()
+        log_memory_usage("End of training")
 
     @torch.no_grad()
     def validate(self):
+        log_memory_usage("Start of validation")
         self.student_model.eval()
         total_loss = 0
         all_preds, all_targets = [], []
@@ -427,6 +484,7 @@ class DistillationTrainer:
         mse = mean_squared_error(all_targets, all_preds) if all_preds else float('inf')
         accuracy = accuracy_score([round(t) for t in all_targets], [round(p) for p in all_preds]) if all_preds else 0.0
         
+        log_memory_usage("End of validation")
         return total_loss / len(self.val_loader), mse, accuracy
 
     @staticmethod
@@ -455,58 +513,13 @@ class DistillationTrainer:
         self.step = checkpoint['step']
         return checkpoint['epoch']
 
-    def train(self, num_epochs):
-        best_val_loss = float('inf')
-        for epoch in range(num_epochs):
-            epoch_loss = 0
-            progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
-            for batch in progress_bar:
-                loss = self.train_step(batch)
-                epoch_loss += loss
-                progress_bar.set_postfix({'loss': f'{loss:.4f}'})
-                
-                self.writer.add_scalar('Loss/train', loss, self.step)
-                self.writer.add_scalar('LearningRate', self.scheduler.get_last_lr()[0], self.step)
-                
-                # Progressive Resizing
-                if self.step % self.config.resize_interval == 0:
-                    self.increase_sequence_length()
-                
-                if self.step >= self.config.max_steps:
-                    break
-
-            epoch_loss /= len(self.train_loader)
-            val_loss, val_mse, val_accuracy = self.validate()
-            
-            self.writer.add_scalar('Loss/val', val_loss, epoch)
-            self.writer.add_scalar('MSE/val', val_mse, epoch)
-            self.writer.add_scalar('Accuracy/val', val_accuracy, epoch)
-            
-            logger.info(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, Val MSE: {val_mse:.4f}, Val Accuracy: {val_accuracy:.4f}")
-            
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                self.save_checkpoint(epoch, epoch_loss)
-            
-            if self.step >= self.config.max_steps:
-                break
-
-        self.writer.close()
-
     def adaptive_layer_freezing(self):
-        # Implement a strategy to freeze and unfreeze layers
         num_layers = len(self.student_model.layers)
         layers_to_freeze = int(num_layers * (1 - self.step / self.config.max_steps))
         
         for i, layer in enumerate(self.student_model.layers):
             for param in layer.parameters():
                 param.requires_grad = (i >= layers_to_freeze)
-
-    def prune_model(self):
-        for name, module in self.student_model.named_modules():
-            if isinstance(module, nn.Linear):
-                prune.l1_unstructured(module, name='weight', amount=self.pruning_amount)
-                prune.remove(module, 'weight')
 
     def increase_sequence_length(self):
         if self.current_seq_length < self.max_seq_length:
@@ -516,14 +529,14 @@ class DistillationTrainer:
             )
             logger.info(f"Increased sequence length to {self.current_seq_length}")
 
-
 def setup_data_and_model(config):
+    log_memory_usage("Start of setup_data_and_model")
     logger.info("Starting setup_data_and_model")
     start_time = time.time()
 
     tokenizer = load_tokenizer(config)
+    log_memory_usage("After loading tokenizer")
     
-    # Set the vocab_size based on the tokenizer
     config.vocab_size = len(tokenizer)
     logger.info(f"Setting vocab_size to {config.vocab_size} based on tokenizer")
 
@@ -534,11 +547,11 @@ def setup_data_and_model(config):
 
     processed_datasets = {}
     for name, dataset in datasets.items():
+        log_memory_usage(f"Before processing {name} dataset")
         logger.info(f"Processing {name} dataset")
         try:
             start_process_time = time.time()
             
-            # Use a subset of the data if specified in config
             if hasattr(config, 'subset_size') and config.subset_size > 0:
                 subset_size = min(config.subset_size, len(dataset['train']))
                 logger.info(f"Using a subset of {subset_size} examples from {name} dataset")
@@ -551,6 +564,7 @@ def setup_data_and_model(config):
         except Exception as e:
             logger.error(f"Error processing {name} dataset: {e}")
             continue
+        log_memory_usage(f"After processing {name} dataset")
 
     train_loaders, val_loaders = {}, {}
     for name, dataset in processed_datasets.items():
@@ -577,9 +591,11 @@ def setup_data_and_model(config):
             logger.error(f"Error creating data loaders for {name}: {e}")
             continue
 
+    log_memory_usage("Before initializing student model")
     logger.info(f"Initializing student model with vocab size: {config.vocab_size}")
     model = EnhancedPEERLanguageModel(config, config.n_experts, config.n_heads, config.top_k, config.d_key, share_params=config.share_params)
-    
+    log_memory_usage("After initializing student model")
+    log_memory_usage("Before loading teacher model")
     logger.info("Loading teacher model")
     safetensor_files = [f for f in os.listdir() if f.endswith('.safetensors')]
     safetensor_files.sort()
@@ -591,11 +607,14 @@ def setup_data_and_model(config):
     # Ensure the teacher model uses the same vocabulary size
     teacher_model.model.resize_token_embeddings(config.vocab_size)
     logger.info(f"Adjusted teacher model vocab size to {config.vocab_size}")
+    log_memory_usage("After loading teacher model")
 
     logger.info(f"setup_data_and_model completed in {time.time() - start_time:.2f} seconds")
+    log_memory_usage("End of setup_data_and_model")
     return model, teacher_model, tokenizer, train_loaders, val_loaders
 
 def main():
+    log_memory_usage("Start of main function")
     logger.info("Starting main function")
     start_time = time.time()
 
@@ -618,17 +637,19 @@ def main():
     config.device = device
     if torch.cuda.is_available():
         total_gpu_memory = torch.cuda.get_device_properties(device).total_memory
-        #config.max_tokens_per_batch = int(total_gpu_memory * 0.4 // (config.n_positions * 4))
         config.max_tokens_per_batch = int(1024**2)
     else:
         config.max_tokens_per_batch = 1024  # Default value for CPU
 
+    log_memory_usage("Before setup_data_and_model")
     logger.info("Setting up data and model")
     model, teacher_model, tokenizer, train_loaders, val_loaders = setup_data_and_model(config)
+    log_memory_usage("After setup_data_and_model")
     model = model.to(device)
     teacher_model = teacher_model.to(device)
 
     for dataset in config.datasets:
+        log_memory_usage(f"Before training on {dataset} dataset")
         logger.info(f"Starting training on {dataset} dataset")
         train_loader = train_loaders[dataset]
         val_loader = val_loaders[dataset]
@@ -658,6 +679,7 @@ def main():
 
         logger.info(f"Saving model after training on {dataset}")
         torch.save(model.state_dict(), f'{config.checkpoint_dir}/model_after_{dataset}.pth')
+        log_memory_usage(f"After training on {dataset} dataset")
 
     final_loss, final_mse, final_accuracy = trainer.validate()
     logger.info(f"Final Validation - Loss: {final_loss:.4f}, MSE: {final_mse:.4f}, Accuracy: {final_accuracy:.4f}")
@@ -666,6 +688,7 @@ def main():
     torch.save(model.state_dict(), f'{config.checkpoint_dir}/final_math_model.pth')
 
     logger.info(f"Main function completed in {time.time() - start_time:.2f} seconds")
+    log_memory_usage("End of main function")
 
 if __name__ == "__main__":
     main()
