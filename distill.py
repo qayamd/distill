@@ -108,58 +108,39 @@ def load_tokenizer(config):
 
 class EnhancedMathReasoningDataset(Dataset):
     def __init__(self, dataset, tokenizer, max_length):
-        log_memory_usage("Start of EnhancedMathReasoningDataset initialization")
-        logger.info(f"Initializing EnhancedMathReasoningDataset with {len(dataset)} items")
-        start_time = time.time()
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.max_length = max_length
-        logger.info(f"EnhancedMathReasoningDataset initialized in {time.time() - start_time:.2f} seconds")
-        log_memory_usage("End of EnhancedMathReasoningDataset initialization")
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        #log_memory_usage(f"Start of __getitem__ for index {idx}")
-        start_time = time.time()
         item = self.dataset[idx]
         if 'question' in item:  # GSM8K format
-            dialog = f"Question: {item['question']}\nAnswer: {item['answer']}"
+            question = item['question']
+            answer = item['answer']
         elif 'problem' in item:  # NuminaMath format
-            dialog = f"Problem: {item['problem']}\nSolution: {item['solution']}"
+            question = item['problem']
+            answer = item['solution']
         else:
-            dialog = item['text']
-        
+            question = item['text'].split('\n')[0]
+            answer = '\n'.join(item['text'].split('\n')[1:])
+
         encoding = self.tokenizer(
-            dialog,
+            question,
             max_length=self.max_length,
             padding='max_length',
             truncation=True,
             return_tensors='pt'
         )
-        
-        input_ids = encoding['input_ids'].squeeze()
-        attention_mask = encoding['attention_mask'].squeeze()
-        
-        target = self.extract_number(item.get('answer') or item.get('solution') or item['text'])
-        
-        logger.debug(f"Processed item {idx} in {time.time() - start_time:.4f} seconds")
-        #log_memory_usage(f"End of __getitem__ for index {idx}")
-        return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'target': torch.tensor(target, dtype=torch.float) if target is not None else torch.tensor(float('nan'))
-        }
 
-    @staticmethod
-    def extract_number(text):
-        match = re.search(r'-?\d+\.?\d*', text.split('\n')[-1])
-        if match:
-            return float(match.group())
-        else:
-            logger.debug(f"Failed to extract number from: {text}")
-            return None
+        return {
+            'input_ids': encoding['input_ids'].squeeze(),
+            'attention_mask': encoding['attention_mask'].squeeze(),
+            'question': question,
+            'answer': answer
+        }
 
 class DynamicBatchSampler:
     def __init__(self, dataset, max_tokens, max_batch_size):
@@ -299,6 +280,52 @@ class EnhancedPEERLanguageModel(nn.Module):
         x = self.hidden_proj(x)
         return self.output(x), attention_maps, layer_outputs
 
+    def generate(self, input_ids, attention_mask=None, max_length=200, num_return_sequences=1, no_repeat_ngram_size=2, do_sample=True, top_k=50, top_p=0.95, temperature=0.7):
+        batch_size = input_ids.shape[0]
+        generated = input_ids.clone()
+        
+        for _ in range(max_length - input_ids.shape[1]):
+            outputs = self.forward(generated, attention_mask=attention_mask)
+            next_token_logits = outputs[0][:, -1, :]
+            
+            if do_sample:
+                # Temperature
+                next_token_logits = next_token_logits / temperature
+                # Top-k
+                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                next_token_logits[indices_to_remove] = -float('Inf')
+                # Top-p
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                next_token_logits[indices_to_remove] = -float('Inf')
+                # Sample
+                probs = F.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                next_token = torch.argmax(next_token_logits, dim=-1)
+            
+            generated = torch.cat([generated, next_token.unsqueeze(-1)], dim=-1)
+            if attention_mask is not None:
+                attention_mask = torch.cat([attention_mask, attention_mask.new_ones((batch_size, 1))], dim=-1)
+            
+            # No repeat ngram
+            if no_repeat_ngram_size > 0:
+                for i in range(batch_size):
+                    gen_tokens = generated[i].tolist()
+                    for ngram in zip(*[gen_tokens[j:] for j in range(no_repeat_ngram_size)]):
+                        if gen_tokens[-no_repeat_ngram_size:] == list(ngram):
+                            generated[i, -1] = torch.randint(self.config.vocab_size, (1,)).to(generated.device)
+            
+            # Early stopping if all sequences have reached the end token
+            if (generated[:, -1] == self.config.eos_token_id).all():
+                break
+        
+        return generated
+
     def resize_token_embeddings(self, new_num_tokens):
         if new_num_tokens == self.config.vocab_size:
             return
@@ -359,7 +386,6 @@ class TeacherModel(nn.Module):
 
 class DistillationTrainer:
     def __init__(self, student_model, teacher_model, train_loader, val_loader, tokenizer, config):
-        log_memory_usage("Start of DistillationTrainer initialization")
         self.student_model = student_model.to(config.device)
         self.teacher_model = teacher_model.to(config.device)
         self.train_loader = train_loader
@@ -367,25 +393,15 @@ class DistillationTrainer:
         self.tokenizer = tokenizer
         self.config = config
 
-        self.initial_lr = float(config.learning_rate)
-        self.warmup_steps = config.warmup_steps
-        self.max_steps = config.max_steps
-        self.gradient_accumulation_steps = config.gradient_accumulation_steps
-        self.grad_clip = config.grad_clip
-
-        # Initialize weights
-        self.initialize_weights(self.student_model)
-
         self.optimizer = AdamW(
             self.student_model.parameters(),
-            lr=self.initial_lr,
-            betas=(0.9, 0.999),
-            eps=1e-8,
+            lr=float(config.learning_rate),
+            betas=tuple(config.optimizer['betas']),
+            eps=float(config.optimizer['eps']),
             weight_decay=config.weight_decay
         )
 
         self.lr_scheduler = self.get_lr_scheduler()
-
         self.scaler = torch.cuda.amp.GradScaler(enabled=config.use_mixed_precision)
         
         self.kl_div_loss = nn.KLDivLoss(reduction='batchmean')
@@ -393,59 +409,29 @@ class DistillationTrainer:
         self.step = 0
         
         self.writer = SummaryWriter(log_dir=config.log_dir)
-        
-        self.pruning_amount = config.pruning_amount
-        self.current_seq_length = config.initial_sequence_length
-        self.max_seq_length = config.n_positions
-        log_memory_usage("End of DistillationTrainer initialization")
-
-    def initialize_weights(self, model):
-        for name, param in model.named_parameters():
-            if 'weight' in name:
-                if param.dim() > 1:
-                    nn.init.xavier_uniform_(param)
-                else:
-                    nn.init.zeros_(param)
-            elif 'bias' in name:
-                nn.init.zeros_(param)
 
     def get_lr_scheduler(self):
         def lr_lambda(current_step: int):
-            if current_step < self.warmup_steps:
-                return float(current_step) / float(max(1, self.warmup_steps))
+            if current_step < self.config.warmup_steps:
+                return float(current_step) / float(max(1, self.config.warmup_steps))
             return max(
-                0.0, float(self.max_steps - current_step) / float(max(1, self.max_steps - self.warmup_steps))
+                0.0, float(self.config.max_steps - current_step) / float(max(1, self.config.max_steps - self.config.warmup_steps))
             )
         return LambdaLR(self.optimizer, lr_lambda)
 
     def train_step(self, batch):
-        log_memory_usage("Start of train_step")
         self.student_model.train()
         self.teacher_model.eval()
         
-        input_ids = batch['input_ids'][:, :self.current_seq_length].to(self.config.device)
-        attention_mask = batch['attention_mask'][:, :self.current_seq_length].to(self.config.device)
-        log_memory_usage("After moving batch to GPU")
-
-        self.adaptive_layer_freezing()
+        input_ids = batch['input_ids'].to(self.config.device)
+        attention_mask = batch['attention_mask'].to(self.config.device)
 
         with torch.no_grad():
             teacher_logits, teacher_hidden_states = self.teacher_model(input_ids, attention_mask)
-        log_memory_usage("After teacher model forward pass")
 
         with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
             student_logits, _, student_hidden_states = self.student_model(input_ids, attention_mask)
             student_hidden_states = [self.student_model.hidden_proj(h) for h in student_hidden_states]
-
-            # Debug: Print information about logits
-            logger.debug(f"Student logits shape: {student_logits.shape}")
-            logger.debug(f"Student logits max: {student_logits.max().item()}, min: {student_logits.min().item()}")
-            logger.debug(f"Teacher logits shape: {teacher_logits.shape}")
-            logger.debug(f"Teacher logits max: {teacher_logits.max().item()}, min: {teacher_logits.min().item()}")
-
-            # Scale down the logits to prevent extreme values
-            student_logits = student_logits / 10
-            teacher_logits = teacher_logits / 10
 
             distillation_loss = self.kl_div_loss(
                 F.log_softmax(student_logits / self.config.temperature, dim=-1),
@@ -456,144 +442,105 @@ class DistillationTrainer:
         
             loss = distillation_loss + self.config.layer_wise_loss_weight * layer_wise_loss
 
-            # Debug: Print loss components
-            logger.debug(f"Distillation loss: {distillation_loss.item()}")
-            logger.debug(f"Layer-wise loss: {layer_wise_loss.item()}")
-
-        # Scale the loss
-        loss = loss / 100  # Adjust this scaling factor as needed
-
-        loss = loss / self.gradient_accumulation_steps
         self.scaler.scale(loss).backward()
-        log_memory_usage("After backward pass")
         
-        if (self.step + 1) % self.gradient_accumulation_steps == 0:
+        if (self.step + 1) % self.config.gradient_accumulation_steps == 0:
             self.scaler.unscale_(self.optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), self.grad_clip)
+            torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), self.config.grad_clip)
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
             self.lr_scheduler.step()
-            log_memory_usage("After optimizer step")
-
-            # Log gradient norm
-            self.writer.add_scalar('Grad/norm', grad_norm, self.step)
 
         self.step += 1
-
-        if self.step % self.config.memory['clear_cache_interval'] == 0:
-            torch.cuda.empty_cache()
-            log_memory_usage("After clearing CUDA cache")
-
-        log_memory_usage("End of train_step")
-        return loss.item() * self.gradient_accumulation_steps * 100  # Scale loss back up for reporting
+        return loss.item()
 
     def train(self, num_epochs):
-        log_memory_usage("Start of training")
-        best_val_loss = float('inf')
+        best_val_accuracy = 0
         for epoch in range(num_epochs):
-            log_memory_usage(f"Start of epoch {epoch}")
             epoch_loss = 0
-            progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
-            try:
-                for batch in progress_bar:
-                    loss = self.train_step(batch)
-                    epoch_loss += loss
-                    progress_bar.set_postfix({'loss': f'{loss:.4f}', 'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'})
-                    
-                    self.writer.add_scalar('Loss/train', loss, self.step)
-                    self.writer.add_scalar('LearningRate', self.optimizer.param_groups[0]['lr'], self.step)
-                    
-                    if self.step % self.config.resize_interval == 0:
-                        self.increase_sequence_length()
-                    
-                    if self.step % self.config.memory['clear_cache_interval'] == 0:
-                        torch.cuda.empty_cache()
-                        log_memory_usage("After clearing CUDA cache")
-                    
-                    if self.step >= self.max_steps:
-                        logger.info(f"Reached max_steps ({self.max_steps}) at epoch {epoch+1}")
-                        break
-
-                val_loss, val_mse, val_accuracy = self.validate()
-                self.writer.add_scalar('Loss/val', val_loss, epoch)
-                self.writer.add_scalar('MSE/val', val_mse, epoch)
-                self.writer.add_scalar('Accuracy/val', val_accuracy, epoch)
+            for batch in tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+                loss = self.train_step(batch)
+                epoch_loss += loss
                 
-                logger.info(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {epoch_loss / len(self.train_loader):.4f}, "
-                            f"Val Loss: {val_loss:.4f}, Val MSE: {val_mse:.4f}, Val Accuracy: {val_accuracy:.4f}")
+                self.writer.add_scalar('Loss/train', loss, self.step)
+                self.writer.add_scalar('LearningRate', self.optimizer.param_groups[0]['lr'], self.step)
                 
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    self.save_checkpoint(epoch, epoch_loss / len(self.train_loader))
-
-            except Exception as e:
-                logger.error(f"Error during training: {e}")
-                self.save_checkpoint(epoch, epoch_loss / len(self.train_loader))
-                raise
+                if self.step >= self.config.max_steps:
+                    break
             
-            if self.step >= self.max_steps:
-                logger.info(f"Reached max_steps ({self.max_steps}). Stopping training.")
+            val_loss, val_accuracy = self.validate()
+            self.writer.add_scalar('Loss/val', val_loss, epoch)
+            self.writer.add_scalar('Accuracy/val', val_accuracy, epoch)
+            
+            logger.info(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {epoch_loss / len(self.train_loader):.4f}, "
+                        f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
+            
+            if val_accuracy > best_val_accuracy:
+                best_val_accuracy = val_accuracy
+                self.save_checkpoint(epoch, epoch_loss / len(self.train_loader))
+            
+            if self.step >= self.config.max_steps:
                 break
 
         self.writer.close()
-        log_memory_usage("End of training")
 
     @torch.no_grad()
     def validate(self):
         self.student_model.eval()
+        self.teacher_model.eval()
         total_loss = 0
-        all_preds, all_targets = [], []
-        for batch_idx, batch in enumerate(self.val_loader):
+        correct_predictions = 0
+        total_predictions = 0
+
+        for batch in tqdm(self.val_loader, desc="Validating"):
             input_ids = batch['input_ids'].to(self.config.device)
             attention_mask = batch['attention_mask'].to(self.config.device)
-            targets = batch['target'].to(self.config.device)
             
-            # Log raw targets
-            logger.debug(f"Batch {batch_idx}, Raw targets: {targets[:5]}")
+            # Generate student's answer
+            student_output = self.student_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_length=200,
+                num_return_sequences=1,
+                no_repeat_ngram_size=2,
+                do_sample=True,
+                top_k=50,
+                top_p=0.95,
+                temperature=0.7
+            )
             
-            with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
-                student_logits, _, _ = self.student_model(input_ids, attention_mask)
-                loss = F.cross_entropy(student_logits.view(-1, student_logits.size(-1)), input_ids.view(-1))
+            student_answers = [self.tokenizer.decode(output, skip_special_tokens=True) for output in student_output]
+            
+            # Prepare prompts for teacher evaluation
+            evaluation_prompts = []
+            for question, answer in zip(batch['question'], student_answers):
+                prompt = f"Question: {question}\nStudent's answer: {answer}\nIs this answer correct? Respond with 'Correct' or 'Incorrect' and explain why."
+                evaluation_prompts.append(prompt)
+            
+            # Get teacher's evaluation
+            teacher_input = self.tokenizer(evaluation_prompts, return_tensors="pt", padding=True, truncation=True).to(self.config.device)
+            teacher_output = self.teacher_model.generate(
+                **teacher_input,
+                max_length=100,
+                num_return_sequences=1
+            )
+            
+            teacher_evaluations = [self.tokenizer.decode(output, skip_special_tokens=True) for output in teacher_output]
+            
+            # Count correct predictions
+            for evaluation in teacher_evaluations:
+                if "Correct" in evaluation:
+                    correct_predictions += 1
+                total_predictions += 1
+            
+            # Calculate loss (optional, depending on your needs)
+            student_logits, _, _ = self.student_model(input_ids, attention_mask)
+            loss = F.cross_entropy(student_logits.view(-1, student_logits.size(-1)), input_ids.view(-1))
             total_loss += loss.item()
-            
-            # Check for NaN or inf values
-            if torch.isnan(student_logits).any() or torch.isinf(student_logits).any():
-                logger.warning(f"Batch {batch_idx}: NaN or inf values detected in student_logits")
-            
-            pred_tokens = student_logits.argmax(dim=-1)
-            
-            # Log tokenized input and output
-            logger.debug(f"Batch {batch_idx}, Input tokens: {input_ids[0][:10]}")
-            logger.debug(f"Batch {batch_idx}, Predicted tokens: {pred_tokens[0][:10]}")
-            
-            decoded_preds = [self.tokenizer.decode(tokens) for tokens in pred_tokens]
-            logger.debug(f"Batch {batch_idx}, Decoded prediction: {decoded_preds[0][:100]}")
-            
-            preds = [self.extract_number(pred) for pred in decoded_preds]
-            
-            logger.debug(f"Batch {batch_idx}, Extracted numbers: {preds[:5]}")
-            
-            all_preds.extend([p for p in preds if p is not None])
-            all_targets.extend([t.item() for t in targets if not torch.isnan(t)])
         
-        logger.info(f"Validation: Total Preds: {len(all_preds)}, Total Targets: {len(all_targets)}")
-        
-        if all_preds and len(all_preds) == len(all_targets):
-            mse = mean_squared_error(all_targets, all_preds)
-            accuracy = accuracy_score([round(t) for t in all_targets], [round(p) for p in all_preds])
-        else:
-            logger.warning(f"Validation: No valid predictions or mismatched lengths. Preds: {len(all_preds)}, Targets: {len(all_targets)}")
-            mse = float('inf')
-            accuracy = 0.0
-        
-        log_memory_usage("End of validation")
-        return total_loss / len(self.val_loader), mse, accuracy
-
-    @staticmethod
-    def extract_number(text):
-        match = re.search(r'-?\d+\.?\d*', text.split('\n')[-1])
-        return float(match.group()) if match else None
+        accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0
+        return total_loss / len(self.val_loader), accuracy
 
     def save_checkpoint(self, epoch, loss):
         checkpoint_path = f'{self.config.checkpoint_dir}/checkpoint_epoch_{epoch}.pth'
@@ -601,7 +548,7 @@ class DistillationTrainer:
             'epoch': epoch,
             'model_state_dict': self.student_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),  
+            'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),
             'loss': loss,
             'step': self.step,
         }, checkpoint_path)
@@ -612,7 +559,7 @@ class DistillationTrainer:
         checkpoint = torch.load(checkpoint_path)
         self.student_model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
         self.step = checkpoint['step']
         return checkpoint['epoch']
 
@@ -633,17 +580,9 @@ class DistillationTrainer:
             logger.info(f"Increased sequence length to {self.current_seq_length}")
 
 def setup_data_and_model(config):
-    log_memory_usage("Start of setup_data_and_model")
-    logger.info("Starting setup_data_and_model")
-    start_time = time.time()
-
     tokenizer, num_added_tokens = load_tokenizer(config)
-    log_memory_usage("After loading tokenizer")
-    
     config.vocab_size = len(tokenizer)
-    logger.info(f"Setting vocab_size to {config.vocab_size} based on tokenizer")
 
-    logger.info("Loading datasets")
     datasets = {
         'numina_cot': load_dataset("AI-MO/NuminaMath-CoT"),
         'gsm8k': load_dataset("gsm8k", "main")
@@ -651,103 +590,40 @@ def setup_data_and_model(config):
 
     processed_datasets = {}
     for name, dataset in datasets.items():
-        logger.info(f"Loaded {name} dataset with {len(dataset['train'])} examples")
-        log_memory_usage(f"Before processing {name} dataset")
-        logger.info(f"Processing {name} dataset")
-        try:
-            start_process_time = time.time()
-            
-            if config.subset_size > 0:
-                subset_size = min(config.subset_size, len(dataset['train']))
-                logger.info(f"Using a subset of {subset_size} examples from {name} dataset")
-                subset_data = list(islice(dataset['train'], subset_size))
-                processed_datasets[name] = EnhancedMathReasoningDataset(subset_data, tokenizer, max_length=config.n_positions)
-            else:
-                processed_datasets[name] = EnhancedMathReasoningDataset(dataset['train'], tokenizer, max_length=config.n_positions)
-            
-            logger.info(f"{name} dataset processed in {time.time() - start_process_time:.2f} seconds. Size: {len(processed_datasets[name])}")
-        except Exception as e:
-            logger.error(f"Error processing {name} dataset: {e}")
-            logger.exception("Detailed traceback:")
-            continue
-        log_memory_usage(f"After processing {name} dataset")
+        if config.subset_size > 0:
+            subset_size = min(config.subset_size, len(dataset['train']))
+            subset_data = list(islice(dataset['train'], subset_size))
+            processed_datasets[name] = EnhancedMathReasoningDataset(subset_data, tokenizer, max_length=config.n_positions)
+        else:
+            processed_datasets[name] = EnhancedMathReasoningDataset(dataset['train'], tokenizer, max_length=config.n_positions)
 
     train_loaders, val_loaders = {}, {}
     for name, dataset in processed_datasets.items():
-        logger.info(f"Creating data loaders for {name}")
-        start_loader_time = time.time()
-        try:
-            train_size = int(0.9 * len(dataset))
-            train_dataset, val_dataset = random_split(dataset, [train_size, len(dataset) - train_size])
-            
-            logger.info(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
-            
-            train_sampler = DynamicBatchSampler(train_dataset, max_tokens=config.max_tokens_per_batch, max_batch_size=config.max_batch_size)
-            val_sampler = DynamicBatchSampler(val_dataset, max_tokens=config.max_tokens_per_batch, max_batch_size=config.max_batch_size)
-            
-            train_loaders[name] = DataLoader(train_dataset, batch_sampler=train_sampler, num_workers=config.dataloader['num_workers'], pin_memory=config.dataloader['pin_memory'])
-            val_loaders[name] = DataLoader(val_dataset, batch_sampler=val_sampler, num_workers=config.dataloader['num_workers'], pin_memory=config.dataloader['pin_memory'])
-            
-            logger.info(f"Data loaders created for {name} in {time.time() - start_loader_time:.2f} seconds")
-        except Exception as e:
-            logger.error(f"Error creating data loaders for {name}: {e}")
-            logger.exception("Detailed traceback:")
-            continue
+        train_size = int(0.9 * len(dataset))
+        train_dataset, val_dataset = random_split(dataset, [train_size, len(dataset) - train_size])
+        
+        train_sampler = DynamicBatchSampler(train_dataset, max_tokens=config.max_tokens_per_batch, max_batch_size=config.max_batch_size)
+        val_sampler = DynamicBatchSampler(val_dataset, max_tokens=config.max_tokens_per_batch, max_batch_size=config.max_batch_size)
+        
+        train_loaders[name] = DataLoader(train_dataset, batch_sampler=train_sampler, num_workers=config.dataloader['num_workers'], pin_memory=config.dataloader['pin_memory'])
+        val_loaders[name] = DataLoader(val_dataset, batch_sampler=val_sampler, num_workers=config.dataloader['num_workers'], pin_memory=config.dataloader['pin_memory'])
 
-    logger.info(f"Processed datasets: {list(processed_datasets.keys())}")
-    logger.info(f"Train loaders: {list(train_loaders.keys())}")
-    logger.info(f"Val loaders: {list(val_loaders.keys())}")
-
-    log_memory_usage("Before initializing student model")
-    logger.info(f"Initializing student model with vocab size: {config.vocab_size}")
-    model = EnhancedPEERLanguageModel(config, config.n_experts, config.n_heads, config.top_k, config.d_key, share_params=config.share_params)
+    student_model = EnhancedPEERLanguageModel(config, config.n_experts, config.n_heads, config.top_k, config.d_key, share_params=config.share_params)
     
     if num_added_tokens > 0:
-        model.resize_token_embeddings(config.vocab_size)
-        logger.info(f"Resized model embeddings to {config.vocab_size}")
-    
-    log_memory_usage("After initializing student model")
-    log_memory_usage("Before loading teacher model")
-    logger.info("Loading teacher model")
+        student_model.resize_token_embeddings(config.vocab_size)
+
     teacher_model = TeacherModel(config.teacher_model['files'])
-
     teacher_model.model.resize_token_embeddings(config.vocab_size)
-    logger.info(f"Adjusted teacher model vocab size to {config.vocab_size}")
-    log_memory_usage("After loading teacher model")
 
-    logger.info(f"setup_data_and_model completed in {time.time() - start_time:.2f} seconds")
-    log_memory_usage("End of setup_data_and_model")
-    return model, teacher_model, tokenizer, train_loaders, val_loaders
-
-def check_config(config):
-    required_keys = ['max_tokens_per_batch', 'max_batch_size', 'dataloader', 'subset_size']
-    for key in required_keys:
-        if not hasattr(config, key):
-            raise ValueError(f"Missing required configuration: {key}")
-    
-    if not isinstance(config.datasets, list) or len(config.datasets) == 0:
-        raise ValueError("config.datasets must be a non-empty list")
-    
-    for dataset in config.datasets:
-        if dataset not in config.num_epochs:
-            raise ValueError(f"Missing num_epochs configuration for dataset: {dataset}")
+    return student_model, teacher_model, tokenizer, train_loaders, val_loaders
 
 def main():
-    log_memory_usage("Start of main function")
-    logger.info("Starting main function")
-    start_time = time.time()
-
-    # Load configuration from YAML file
     with open('config.yaml', 'r') as f:
         config = yaml.safe_load(f)
     
-    # Convert config to an object for easier access
     config = type('Config', (), config)()
     
-    # Check configuration
-    check_config(config)
-    
-    # Set up logging
     os.makedirs(config.log_dir, exist_ok=True)
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     if config.logging['log_to_file']:
@@ -755,22 +631,17 @@ def main():
         file_handler.setLevel(getattr(logging, config.logging['level']))
         logger.addHandler(file_handler)
     
-    # Set random seeds for reproducibility
     torch.manual_seed(config.seed)
     random.seed(config.seed)
     
     device = torch.device(config.device)
     config.device = device
 
-    log_memory_usage("Before setup_data_and_model")
-    logger.info("Setting up data and model")
-    model, teacher_model, tokenizer, train_loaders, val_loaders = setup_data_and_model(config)
-    log_memory_usage("After setup_data_and_model")
-    model = model.to(device)
+    student_model, teacher_model, tokenizer, train_loaders, val_loaders = setup_data_and_model(config)
+    student_model = student_model.to(device)
     teacher_model = teacher_model.to(device)
 
     for dataset in config.datasets:
-        log_memory_usage(f"Before training on {dataset} dataset")
         logger.info(f"Starting training on {dataset} dataset")
         
         if dataset not in train_loaders or dataset not in val_loaders:
@@ -781,7 +652,7 @@ def main():
         val_loader = val_loaders[dataset]
 
         trainer = DistillationTrainer(
-            student_model=model,
+            student_model=student_model,
             teacher_model=teacher_model,
             train_loader=train_loader,
             val_loader=val_loader,
@@ -791,10 +662,8 @@ def main():
 
         checkpoint_path = f'{config.checkpoint_dir}/checkpoint_{dataset}_latest.pth'
         if os.path.exists(checkpoint_path):
-            logger.info(f"Loading checkpoint: {checkpoint_path}")
             start_epoch = trainer.load_checkpoint(checkpoint_path)
         else:
-            logger.info("No checkpoint found, starting from epoch 0")
             start_epoch = 0
 
         logger.info(f"Training for {config.num_epochs[dataset] - start_epoch} epochs")
@@ -805,33 +674,20 @@ def main():
             logger.exception("Detailed traceback:")
             continue
 
-        try:
-            val_loss, val_mse, val_accuracy = trainer.validate()
-            logger.info(f"Validation after {dataset} - Loss: {val_loss:.4f}, MSE: {val_mse:.4f}, Accuracy: {val_accuracy:.4f}")
-        except Exception as e:
-            logger.error(f"Error during validation after {dataset}: {e}")
-            logger.exception("Detailed traceback:")
+        val_loss, val_accuracy = trainer.validate()
+        logger.info(f"Validation after {dataset} - Loss: {val_loss:.4f}, Accuracy: {val_accuracy:.4f}")
 
         logger.info(f"Saving model after training on {dataset}")
-        torch.save(model.state_dict(), f'{config.checkpoint_dir}/model_after_{dataset}.pth')
-        log_memory_usage(f"After training on {dataset} dataset")
+        torch.save(student_model.state_dict(), f'{config.checkpoint_dir}/model_after_{dataset}.pth')
 
-        # Force garbage collection and clear CUDA cache
         gc.collect()
         torch.cuda.empty_cache()
 
-    try:
-        final_loss, final_mse, final_accuracy = trainer.validate()
-        logger.info(f"Final Validation - Loss: {final_loss:.4f}, MSE: {final_mse:.4f}, Accuracy: {final_accuracy:.4f}")
-    except Exception as e:
-        logger.error(f"Error during final validation: {e}")
-        logger.exception("Detailed traceback:")
+    final_loss, final_accuracy = trainer.validate()
+    logger.info(f"Final Validation - Loss: {final_loss:.4f}, Accuracy: {final_accuracy:.4f}")
 
     logger.info("Saving final model")
-    torch.save(model.state_dict(), f'{config.checkpoint_dir}/final_math_model.pth')
-
-    logger.info(f"Main function completed in {time.time() - start_time:.2f} seconds")
-    log_memory_usage("End of main function")
+    torch.save(student_model.state_dict(), f'{config.checkpoint_dir}/final_math_model.pth')
 
 if __name__ == "__main__":
     main()
