@@ -438,6 +438,59 @@ class DistillationTrainer:
         log_memory_usage("End of train_step")
         return loss.item()
 
+
+    def train(self, num_epochs):
+        log_memory_usage("Start of training")
+        best_val_loss = float('inf')
+        for epoch in range(num_epochs):
+            log_memory_usage(f"Start of epoch {epoch}")
+            epoch_loss = 0
+            progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+            try:
+                for batch in progress_bar:
+                    loss = self.train_step(batch)
+                    epoch_loss += loss
+                    progress_bar.set_postfix({'loss': f'{loss:.4f}'})
+                    
+                    self.writer.add_scalar('Loss/train', loss, self.step)
+                    self.writer.add_scalar('LearningRate', self.scheduler.get_last_lr()[0], self.step)
+                    
+                    if self.step % self.config.resize_interval == 0:
+                        self.increase_sequence_length()
+                    
+                    if self.step % self.config.memory['clear_cache_interval'] == 0:
+                        torch.cuda.empty_cache()
+                        log_memory_usage("After clearing CUDA cache")
+                    
+                    if self.step >= self.config.max_steps:
+                        break
+            except Exception as e:
+                logger.error(f"Error during training: {e}")
+                self.save_checkpoint(epoch, epoch_loss / len(self.train_loader))
+                raise
+
+            epoch_loss /= len(self.train_loader)
+            val_loss, val_mse, val_accuracy = self.validate()
+            
+            self.writer.add_scalar('Loss/val', val_loss, epoch)
+            self.writer.add_scalar('MSE/val', val_mse, epoch)
+            self.writer.add_scalar('Accuracy/val', val_accuracy, epoch)
+            
+            logger.info(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, Val MSE: {val_mse:.4f}, Val Accuracy: {val_accuracy:.4f}")
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                self.save_checkpoint(epoch, epoch_loss)
+            
+            self.scheduler.step()
+            
+            if self.step >= self.config.max_steps:
+                break
+            log_memory_usage(f"End of epoch {epoch}")
+
+        self.writer.close()
+        log_memory_usage("End of training")
+
     @torch.no_grad()
     def validate(self):
         log_memory_usage("Start of validation")
@@ -470,8 +523,6 @@ class DistillationTrainer:
         
         log_memory_usage("End of validation")
         return total_loss / len(self.val_loader), mse, accuracy
-
-    # ... (other methods remain the same)
 
     @staticmethod
     def extract_number(text):
