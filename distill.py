@@ -24,6 +24,7 @@ from itertools import islice
 from typing import Optional
 from torch.optim import AdamW
 import os
+from torch.optim.lr_scheduler import LambdaLR
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Configure logging
@@ -362,24 +363,30 @@ class DistillationTrainer:
         self.tokenizer = tokenizer
         self.config = config
 
+        # 1. Implement learning rate warm-up
+        self.initial_lr = float(config.learning_rate)
+        self.warmup_steps = config.warmup_steps
+        self.lr_scheduler = self.get_lr_scheduler()
+
+        # 2. Use a larger batch size if possible, or implement gradient accumulation
+        self.gradient_accumulation_steps = config.gradient_accumulation_steps
+
+        # 3. Adjust gradient clipping
+        self.grad_clip = config.grad_clip
+
         self.optimizer = AdamW(
             self.student_model.parameters(),
-            lr=float(config.learning_rate),
-            betas=tuple(config.optimizer['betas']),  
-            eps=float(config.optimizer['eps']), 
+            lr=self.initial_lr,
+            betas=(0.9, 0.999),  # Default Adam betas
+            eps=1e-8,  # Default Adam epsilon
             weight_decay=config.weight_decay
         )
 
-        t_0 = len(self.train_loader) * config.scheduler.get('T_0_epochs', 1)
-        self.scheduler = CosineAnnealingWarmRestarts(
-            self.optimizer, 
-            T_0=t_0, 
-            T_mult=config.scheduler['T_mult']
-        )
         self.scaler = torch.cuda.amp.GradScaler(enabled=config.use_mixed_precision)
         
+        # 4. Use smooth L1 loss for layer-wise loss to handle outliers better
         self.kl_div_loss = nn.KLDivLoss(reduction='batchmean')
-        self.mse_loss = nn.MSELoss()
+        self.layer_wise_loss = nn.SmoothL1Loss()
         self.step = 0
         
         self.writer = SummaryWriter(log_dir=config.log_dir)
@@ -388,6 +395,15 @@ class DistillationTrainer:
         self.current_seq_length = config.initial_sequence_length
         self.max_seq_length = config.n_positions
         log_memory_usage("End of DistillationTrainer initialization")
+
+    def get_lr_scheduler(self):
+        def lr_lambda(current_step: int):
+            if current_step < self.warmup_steps:
+                return float(current_step) / float(max(1, self.warmup_steps))
+            return max(
+                0.0, float(self.config.max_steps - current_step) / float(max(1, self.config.max_steps - self.warmup_steps))
+            )
+        return LambdaLR(self.optimizer, lr_lambda)
 
     def train_step(self, batch):
         log_memory_usage("Start of train_step")
@@ -413,20 +429,24 @@ class DistillationTrainer:
                 F.softmax(teacher_logits / self.config.temperature, dim=-1)
             ) * (self.config.temperature ** 2)
         
-            layer_wise_loss = sum(self.mse_loss(s, t) for s, t in zip(student_hidden_states, teacher_hidden_states))
+            layer_wise_loss = sum(self.layer_wise_loss(s, t) for s, t in zip(student_hidden_states, teacher_hidden_states))
         
             loss = distillation_loss + self.config.layer_wise_loss_weight * layer_wise_loss
 
+        # Gradient accumulation
+        loss = loss / self.gradient_accumulation_steps
         self.scaler.scale(loss).backward()
         log_memory_usage("After backward pass")
         
-        if (self.step + 1) % self.config.gradient_accumulation_steps == 0:
+        if (self.step + 1) % self.gradient_accumulation_steps == 0:
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), self.config.grad_clip)
+            # 3. Adjust gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), self.grad_clip)
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
-            loss = loss / self.config.gradient_accumulation_steps
+            # Update learning rate
+            self.lr_scheduler.step()
             log_memory_usage("After optimizer step")
 
         self.step += 1
@@ -436,8 +456,7 @@ class DistillationTrainer:
             log_memory_usage("After clearing CUDA cache")
 
         log_memory_usage("End of train_step")
-        return loss.item()
-
+        return loss.item() * self.gradient_accumulation_steps  # Scale loss back up for reporting
 
     def train(self, num_epochs):
         log_memory_usage("Start of training")
@@ -450,10 +469,10 @@ class DistillationTrainer:
                 for batch in progress_bar:
                     loss = self.train_step(batch)
                     epoch_loss += loss
-                    progress_bar.set_postfix({'loss': f'{loss:.4f}'})
+                    progress_bar.set_postfix({'loss': f'{loss:.4f}', 'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'})
                     
                     self.writer.add_scalar('Loss/train', loss, self.step)
-                    self.writer.add_scalar('LearningRate', self.scheduler.get_last_lr()[0], self.step)
+                    self.writer.add_scalar('LearningRate', self.optimizer.param_groups[0]['lr'], self.step)
                     
                     if self.step % self.config.resize_interval == 0:
                         self.increase_sequence_length()
@@ -464,29 +483,27 @@ class DistillationTrainer:
                     
                     if self.step >= self.config.max_steps:
                         break
+
+                # Validate and save checkpoint after each epoch
+                val_loss, val_mse, val_accuracy = self.validate()
+                self.writer.add_scalar('Loss/val', val_loss, epoch)
+                self.writer.add_scalar('MSE/val', val_mse, epoch)
+                self.writer.add_scalar('Accuracy/val', val_accuracy, epoch)
+                
+                logger.info(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {epoch_loss / len(self.train_loader):.4f}, "
+                            f"Val Loss: {val_loss:.4f}, Val MSE: {val_mse:.4f}, Val Accuracy: {val_accuracy:.4f}")
+                
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    self.save_checkpoint(epoch, epoch_loss / len(self.train_loader))
+
             except Exception as e:
                 logger.error(f"Error during training: {e}")
                 self.save_checkpoint(epoch, epoch_loss / len(self.train_loader))
                 raise
-
-            epoch_loss /= len(self.train_loader)
-            val_loss, val_mse, val_accuracy = self.validate()
-            
-            self.writer.add_scalar('Loss/val', val_loss, epoch)
-            self.writer.add_scalar('MSE/val', val_mse, epoch)
-            self.writer.add_scalar('Accuracy/val', val_accuracy, epoch)
-            
-            logger.info(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, Val MSE: {val_mse:.4f}, Val Accuracy: {val_accuracy:.4f}")
-            
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                self.save_checkpoint(epoch, epoch_loss)
-            
-            self.scheduler.step()
             
             if self.step >= self.config.max_steps:
                 break
-            log_memory_usage(f"End of epoch {epoch}")
 
         self.writer.close()
         log_memory_usage("End of training")
