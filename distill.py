@@ -363,28 +363,26 @@ class DistillationTrainer:
         self.tokenizer = tokenizer
         self.config = config
 
-        # 1. Implement learning rate warm-up
         self.initial_lr = float(config.learning_rate)
         self.warmup_steps = config.warmup_steps
-        self.lr_scheduler = self.get_lr_scheduler()
-
-        # 2. Use a larger batch size if possible, or implement gradient accumulation
+        self.max_steps = config.max_steps
         self.gradient_accumulation_steps = config.gradient_accumulation_steps
-
-        # 3. Adjust gradient clipping
         self.grad_clip = config.grad_clip
 
+        # Create optimizer before scheduler
         self.optimizer = AdamW(
             self.student_model.parameters(),
             lr=self.initial_lr,
-            betas=(0.9, 0.999),  # Default Adam betas
-            eps=1e-8,  # Default Adam epsilon
+            betas=(0.9, 0.999),
+            eps=1e-8,
             weight_decay=config.weight_decay
         )
 
+        # Now create the learning rate scheduler
+        self.lr_scheduler = self.get_lr_scheduler()
+
         self.scaler = torch.cuda.amp.GradScaler(enabled=config.use_mixed_precision)
         
-        # 4. Use smooth L1 loss for layer-wise loss to handle outliers better
         self.kl_div_loss = nn.KLDivLoss(reduction='batchmean')
         self.layer_wise_loss = nn.SmoothL1Loss()
         self.step = 0
@@ -401,7 +399,7 @@ class DistillationTrainer:
             if current_step < self.warmup_steps:
                 return float(current_step) / float(max(1, self.warmup_steps))
             return max(
-                0.0, float(self.config.max_steps - current_step) / float(max(1, self.config.max_steps - self.warmup_steps))
+                0.0, float(self.max_steps - current_step) / float(max(1, self.max_steps - self.warmup_steps))
             )
         return LambdaLR(self.optimizer, lr_lambda)
 
