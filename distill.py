@@ -369,7 +369,9 @@ class DistillationTrainer:
         self.gradient_accumulation_steps = config.gradient_accumulation_steps
         self.grad_clip = config.grad_clip
 
-        # Create optimizer before scheduler
+        # Initialize weights
+        self.initialize_weights(self.student_model)
+
         self.optimizer = AdamW(
             self.student_model.parameters(),
             lr=self.initial_lr,
@@ -378,7 +380,6 @@ class DistillationTrainer:
             weight_decay=config.weight_decay
         )
 
-        # Now create the learning rate scheduler
         self.lr_scheduler = self.get_lr_scheduler()
 
         self.scaler = torch.cuda.amp.GradScaler(enabled=config.use_mixed_precision)
@@ -393,6 +394,16 @@ class DistillationTrainer:
         self.current_seq_length = config.initial_sequence_length
         self.max_seq_length = config.n_positions
         log_memory_usage("End of DistillationTrainer initialization")
+
+    def initialize_weights(self, model):
+        for name, param in model.named_parameters():
+            if 'weight' in name:
+                if param.dim() > 1:
+                    nn.init.xavier_uniform_(param)
+                else:
+                    nn.init.zeros_(param)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
 
     def get_lr_scheduler(self):
         def lr_lambda(current_step: int):
@@ -422,6 +433,10 @@ class DistillationTrainer:
             student_logits, _, student_hidden_states = self.student_model(input_ids, attention_mask)
             student_hidden_states = [self.student_model.hidden_proj(h) for h in student_hidden_states]
 
+            # Scale down the logits to prevent extreme values
+            student_logits = student_logits / 10
+            teacher_logits = teacher_logits / 10
+
             distillation_loss = self.kl_div_loss(
                 F.log_softmax(student_logits / self.config.temperature, dim=-1),
                 F.softmax(teacher_logits / self.config.temperature, dim=-1)
@@ -431,21 +446,24 @@ class DistillationTrainer:
         
             loss = distillation_loss + self.config.layer_wise_loss_weight * layer_wise_loss
 
-        # Gradient accumulation
+        # Scale the loss
+        loss = loss / 100  # Adjust this scaling factor as needed
+
         loss = loss / self.gradient_accumulation_steps
         self.scaler.scale(loss).backward()
         log_memory_usage("After backward pass")
         
         if (self.step + 1) % self.gradient_accumulation_steps == 0:
             self.scaler.unscale_(self.optimizer)
-            # 3. Adjust gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), self.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), self.grad_clip)
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
-            # Update learning rate
             self.lr_scheduler.step()
             log_memory_usage("After optimizer step")
+
+            # Log gradient norm
+            self.writer.add_scalar('Grad/norm', grad_norm, self.step)
 
         self.step += 1
 
@@ -454,7 +472,7 @@ class DistillationTrainer:
             log_memory_usage("After clearing CUDA cache")
 
         log_memory_usage("End of train_step")
-        return loss.item() * self.gradient_accumulation_steps  # Scale loss back up for reporting
+        return loss.item() * self.gradient_accumulation_steps * 100  # Scale loss back up for reporting
 
     def train(self, num_epochs):
         log_memory_usage("Start of training")
@@ -479,10 +497,9 @@ class DistillationTrainer:
                         torch.cuda.empty_cache()
                         log_memory_usage("After clearing CUDA cache")
                     
-                    if self.step >= self.config.max_steps:
+                    if self.step >= self.max_steps:
                         break
 
-                # Validate and save checkpoint after each epoch
                 val_loss, val_mse, val_accuracy = self.validate()
                 self.writer.add_scalar('Loss/val', val_loss, epoch)
                 self.writer.add_scalar('MSE/val', val_mse, epoch)
@@ -500,7 +517,7 @@ class DistillationTrainer:
                 self.save_checkpoint(epoch, epoch_loss / len(self.train_loader))
                 raise
             
-            if self.step >= self.config.max_steps:
+            if self.step >= self.max_steps:
                 break
 
         self.writer.close()
