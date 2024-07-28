@@ -22,6 +22,7 @@ from torch.utils.tensorboard import SummaryWriter
 from safetensors.torch import load_file
 from itertools import islice
 from typing import Optional
+from torch.optim import AdamW
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -362,8 +363,8 @@ class DistillationTrainer:
         self.optimizer = AdamW(
             self.student_model.parameters(),
             lr=float(config.learning_rate),
-            betas=config.optimizer['betas'],
-            eps=config.optimizer['eps'],
+            betas=tuple(config.optimizer['betas']),  
+            eps=float(config.optimizer['eps']), 
             weight_decay=config.weight_decay
         )
 
