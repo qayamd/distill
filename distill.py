@@ -541,35 +541,43 @@ class DistillationTrainer:
 
     @torch.no_grad()
     def validate(self):
-        log_memory_usage("Start of validation")
         self.student_model.eval()
         total_loss = 0
         all_preds, all_targets = [], []
-        for batch in self.val_loader:
+        for batch_idx, batch in enumerate(self.val_loader):
             input_ids = batch['input_ids'].to(self.config.device)
             attention_mask = batch['attention_mask'].to(self.config.device)
             targets = batch['target'].to(self.config.device)
+            
+            # Log raw targets
+            logger.debug(f"Batch {batch_idx}, Raw targets: {targets[:5]}")
             
             with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
                 student_logits, _, _ = self.student_model(input_ids, attention_mask)
                 loss = F.cross_entropy(student_logits.view(-1, student_logits.size(-1)), input_ids.view(-1))
             total_loss += loss.item()
             
+            # Check for NaN or inf values
+            if torch.isnan(student_logits).any() or torch.isinf(student_logits).any():
+                logger.warning(f"Batch {batch_idx}: NaN or inf values detected in student_logits")
+            
             pred_tokens = student_logits.argmax(dim=-1)
             
-            # Debug: Print some information about the predictions
-            logger.debug(f"Pred tokens shape: {pred_tokens.shape}")
-            logger.debug(f"First prediction: {self.tokenizer.decode(pred_tokens[0])}")
+            # Log tokenized input and output
+            logger.debug(f"Batch {batch_idx}, Input tokens: {input_ids[0][:10]}")
+            logger.debug(f"Batch {batch_idx}, Predicted tokens: {pred_tokens[0][:10]}")
             
-            preds = [self.extract_number(self.tokenizer.decode(tokens)) for tokens in pred_tokens]
+            decoded_preds = [self.tokenizer.decode(tokens) for tokens in pred_tokens]
+            logger.debug(f"Batch {batch_idx}, Decoded prediction: {decoded_preds[0][:100]}")
             
-            # Debug: Print information about extracted numbers
-            logger.debug(f"Extracted numbers: {preds[:5]}")
+            preds = [self.extract_number(pred) for pred in decoded_preds]
+            
+            logger.debug(f"Batch {batch_idx}, Extracted numbers: {preds[:5]}")
             
             all_preds.extend([p for p in preds if p is not None])
             all_targets.extend([t.item() for t in targets if not torch.isnan(t)])
         
-        logger.info(f"Validation: Preds: {len(all_preds)}, Targets: {len(all_targets)}")
+        logger.info(f"Validation: Total Preds: {len(all_preds)}, Total Targets: {len(all_targets)}")
         
         if all_preds and len(all_preds) == len(all_targets):
             mse = mean_squared_error(all_targets, all_preds)
