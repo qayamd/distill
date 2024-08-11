@@ -485,62 +485,63 @@ class DistillationTrainer:
 
         self.writer.close()
 
-    @torch.no_grad()
-    def validate(self):
-        self.student_model.eval()
-        self.teacher_model.eval()
-        total_loss = 0
-        correct_predictions = 0
-        total_predictions = 0
+        @torch.no_grad()
+        def validate(self):
+            self.student_model.eval()
+            self.teacher_model.eval()
+            total_loss = 0
+            correct_predictions = 0
+            total_predictions = 0
 
-        for batch in tqdm(self.val_loader, desc="Validating"):
-            input_ids = batch['input_ids'].to(self.config.device)
-            attention_mask = batch['attention_mask'].to(self.config.device)
+            for batch in tqdm(self.val_loader, desc="Validating"):
+                input_ids = batch['input_ids'].to(self.config.device)
+                attention_mask = batch['attention_mask'].to(self.config.device)
+                
+                # Generate student's answer
+                student_output = self.student_model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_length=200,
+                    num_return_sequences=1,
+                    no_repeat_ngram_size=2,
+                    do_sample=True,
+                    top_k=50,
+                    top_p=0.95,
+                    temperature=0.7
+                )
+                
+                student_answers = [self.tokenizer.decode(output, skip_special_tokens=True) for output in student_output] 
+                
+                # Prepare prompts for teacher evaluation
+                evaluation_prompts = []
+                for question, answer in zip(batch['question'], student_answers):
+                    prompt = f"Question: {question}\nStudent's answer: {answer}\nIs this answer correct? Respond with 'Correct' or 'Incorrect' and explain why."
+                    evaluation_prompts.append(prompt)
+                
+                # Get teacher's evaluation
+                teacher_input = self.tokenizer(evaluation_prompts, return_tensors="pt", padding=True, truncation=True).to(self.config.device)
+                teacher_output = self.teacher_model.generate(
+                    input_ids=teacher_input.input_ids,
+                    attention_mask=teacher_input.attention_mask,
+                    max_length=100,
+                    num_return_sequences=1
+                )
+                
+                teacher_evaluations = [self.tokenizer.decode(output, skip_special_tokens=True) for output in teacher_output]
+                
+                # Count correct predictions
+                for evaluation in teacher_evaluations:
+                    if "Correct" in evaluation:
+                        correct_predictions += 1
+                    total_predictions += 1
+                
+                # Calculate loss (optional, depending on your needs)
+                student_logits, _, _ = self.student_model(input_ids, attention_mask)
+                loss = F.cross_entropy(student_logits.view(-1, student_logits.size(-1)), input_ids.view(-1))
+                total_loss += loss.item()
             
-            # Generate student's answer
-            student_output = self.student_model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_length=200,
-                num_return_sequences=1,
-                no_repeat_ngram_size=2,
-                do_sample=True,
-                top_k=50,
-                top_p=0.95,
-                temperature=0.7
-            )
-            
-            student_answers = [self.tokenizer.decode(output, skip_special_tokens=True) for output in student_output]
-            
-            # Prepare prompts for teacher evaluation
-            evaluation_prompts = []
-            for question, answer in zip(batch['question'], student_answers):
-                prompt = f"Question: {question}\nStudent's answer: {answer}\nIs this answer correct? Respond with 'Correct' or 'Incorrect' and explain why."
-                evaluation_prompts.append(prompt)
-            
-            # Get teacher's evaluation
-            teacher_input = self.tokenizer(evaluation_prompts, return_tensors="pt", padding=True, truncation=True).to(self.config.device)
-            teacher_output = self.teacher_model.generate(
-                **teacher_input,
-                max_length=100,
-                num_return_sequences=1
-            )
-            
-            teacher_evaluations = [self.tokenizer.decode(output, skip_special_tokens=True) for output in teacher_output]
-            
-            # Count correct predictions
-            for evaluation in teacher_evaluations:
-                if "Correct" in evaluation:
-                    correct_predictions += 1
-                total_predictions += 1
-            
-            # Calculate loss (optional, depending on your needs)
-            student_logits, _, _ = self.student_model(input_ids, attention_mask)
-            loss = F.cross_entropy(student_logits.view(-1, student_logits.size(-1)), input_ids.view(-1))
-            total_loss += loss.item()
-        
-        accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0
-        return total_loss / len(self.val_loader), accuracy
+            accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0
+            return total_loss / len(self.val_loader), accuracy
 
     def save_checkpoint(self, epoch, loss):
         checkpoint_path = f'{self.config.checkpoint_dir}/checkpoint_epoch_{epoch}.pth'
